@@ -1,2 +1,5 @@
 API.env
 *.env
+agents.md
+__pycache__/
+*.pyc
