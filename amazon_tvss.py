@@ -1,6 +1,4 @@
-import asyncio
 import json
-import logging
 import os
 import random
 import re
@@ -133,47 +131,6 @@ class TVSSClient:
             self._tvss_url("products", asin),
         )
         return self._parse_product(data, asin)
-
-    async def products(self, session, asins):
-        concurrency = int(os.getenv("TVSS_CONCURRENCY", "5"))
-        semaphore = asyncio.Semaphore(max(1, concurrency))
-
-        async def fetch(asin):
-            async with semaphore:
-                try:
-                    return await self.product(session, asin)
-                except TVSSConfigError as exc:
-                    logging.error(f"TVSS auth/config check failed for {asin}: {exc}")
-                    return {
-                        "asin": asin,
-                        "title": "N/A",
-                        "in_stock": False,
-                        "link": f"https://www.{self.domain}/dp/{asin}",
-                        "images": [],
-                        "price": None,
-                        "seller": None,
-                        "availability": {},
-                        "source": "tvss",
-                        "error": str(exc),
-                        "error_type": "auth",
-                    }
-                except Exception as exc:
-                    logging.error(f"TVSS product check failed for {asin}: {exc}")
-                    return {
-                        "asin": asin,
-                        "title": "N/A",
-                        "in_stock": False,
-                        "link": f"https://www.{self.domain}/dp/{asin}",
-                        "images": [],
-                        "price": None,
-                        "seller": None,
-                        "availability": {},
-                        "source": "tvss",
-                        "error": str(exc),
-                        "error_type": "request",
-                    }
-
-        return await asyncio.gather(*(fetch(asin) for asin in asins))
 
     def _parse_product(self, data, fallback_asin):
         if not isinstance(data, dict):

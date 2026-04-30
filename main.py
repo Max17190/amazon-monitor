@@ -2,10 +2,11 @@ import asyncio
 import json
 import logging
 import os
-import random
 import re
+import sys
+import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -28,6 +29,7 @@ ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
 DEFAULT_POLL_INTERVAL_SECONDS = 2.0
 MIN_POLL_INTERVAL_SECONDS = 0.5
 MAX_BACKOFF_SECONDS = 60.0
+GENERIC_WEBHOOK_TIMEOUT_SECONDS = 10.0
 
 
 class MonitorConfigError(ValueError):
@@ -43,55 +45,30 @@ class MonitorGroup:
 
 @dataclass(frozen=True)
 class MonitorConfig:
-    backend: str
     poll_interval_seconds: float
     groups: list
+    require_amazon_seller: bool = False
 
 
 class AlertState:
-    """Tracks stock state and returns true only on out-of-stock to in-stock moves."""
+    """Tracks stock state and returns true only on out-of-stock to in-stock moves.
+
+    The first observation of any ASIN is treated as priming and never alerts,
+    so a process restart while an item is in stock does not fire a false-positive
+    transition alert.
+    """
 
     def __init__(self):
         self._states = {}
 
     def observe(self, asin, in_stock):
+        in_stock = bool(in_stock)
+        previously_seen = asin in self._states
         previous = self._states.get(asin, False)
-        self._states[asin] = bool(in_stock)
-        return bool(in_stock) and not previous
-
-
-def get_random_user_agent():
-    user_agents = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 5.1; rv:109.0) Gecko/20100101 Firefox/115.0",
-        "Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 5.1; rv:78.0) Gecko/20100101 Firefox/78.0 Mypal/68.14.5",
-        "Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 5.1; rv:102.0) Gecko/20100101 Goanna/4.0 Firefox/102.0 Basilisk/20231124",
-        "Mozilla/5.0 (Windows NT 5.1; rv:88.0) Gecko/20100101 Firefox/88.0",
-        "Mozilla/5.0 (Windows NT 5.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/86.0.4240.111 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 5.1; rv:6.7) Goanna/6.7 PaleMoon/33.2",
-        "Mozilla/5.0 (Windows NT 5.1; rv:68.9.0) Gecko/20100101 Goanna/4.8 Firefox/68.9.0 Basilisk/52.9.0",
-    ]
-    return random.choice(user_agents)
-
-
-def build_proxy_url(env=None):
-    env = os.environ if env is None else env
-    host = env.get("PROXY_HOST")
-    port = env.get("PROXY_PORT")
-    user = env.get("PROXY_USER")
-    password = env.get("PROXY_PASS")
-
-    values = [host, port, user, password]
-    if not any(values):
-        return None
-    if not all(values):
-        logging.warning("Incomplete proxy configuration; proxy will be disabled")
-        return None
-
-    return f"http://{user}:{password}@{host}:{port}"
+        self._states[asin] = in_stock
+        if not previously_seen:
+            return False
+        return in_stock and not previous
 
 
 def parse_poll_interval(env):
@@ -168,10 +145,6 @@ def load_monitor_config(env=None, webhook_targets=None):
     webhook_targets = webhook_targets if webhook_targets is not None else WEBHOOK_TARGETS
     valid_target_names = set(webhook_targets.keys())
 
-    backend = env.get("AMAZON_MONITOR_BACKEND", "tvss").strip().lower()
-    if backend not in ("tvss", "ajax"):
-        raise MonitorConfigError("AMAZON_MONITOR_BACKEND must be 'tvss' or 'ajax'")
-
     config_data = parse_monitor_config_json(env.get("MONITOR_CONFIG_JSON", ""))
     groups_data = config_data.get("groups")
     if not isinstance(groups_data, list) or not groups_data:
@@ -192,49 +165,99 @@ def load_monitor_config(env=None, webhook_targets=None):
         webhook_names = normalize_webhook_names(raw_webhooks, name, valid_target_names)
         groups.append(MonitorGroup(name=name, asins=asins, webhook_names=webhook_names))
 
+    require_amazon_seller = (
+        str(env.get("MONITOR_REQUIRE_AMAZON_SELLER", "")).strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
     return MonitorConfig(
-        backend=backend,
         poll_interval_seconds=parse_poll_interval(env),
         groups=groups,
+        require_amazon_seller=require_amazon_seller,
     )
 
 
-class BlinkMonitor:
-    def __init__(self, session):
+def build_generic_payload(product_data, group_name=None):
+    price = product_data.get("price")
+    offers = product_data.get("offers") or []
+    if not price and offers:
+        price = offers[0].get("priceInfo", {}).get("price")
+
+    images = product_data.get("images") or []
+    return {
+        "asin": product_data.get("asin"),
+        "title": product_data.get("title"),
+        "in_stock": bool(product_data.get("in_stock")),
+        "price": price,
+        "link": product_data.get("link"),
+        "image": images[0] if images else None,
+        "seller": product_data.get("seller"),
+        "source": product_data.get("source"),
+        "group": group_name,
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+class AlertDispatcher:
+    def __init__(self, session, clock=None):
         self.session = session
-        self.rate_limited = False
+        self._clock = clock or time.monotonic
+        self._target_backoff_until = {}
 
-    async def send_notification(self, product_data, webhook_targets):
-        if self.rate_limited:
-            logging.warning("Skipping webhook sends while Discord rate limit is active")
-            return
+    def _is_target_backed_off(self, target):
+        deadline = self._target_backoff_until.get(target.name)
+        return deadline is not None and self._clock() < deadline
 
+    async def send_notification(self, product_data, webhook_targets, group_name=None):
         if not webhook_targets:
             logging.error("No webhook targets selected for ASIN %s", product_data.get("asin"))
             return
 
         embed = self.create_embed(product_data)
-        tasks = [self._send_to_target(target, embed) for target in webhook_targets]
+        payload = build_generic_payload(product_data, group_name)
+
+        tasks = []
+        for target in webhook_targets:
+            if target.kind == "generic":
+                tasks.append(self._send_generic(target, payload))
+            elif self._is_target_backed_off(target):
+                tasks.append(self._noop_skip(target.name))
+            else:
+                tasks.append(self._send_discord(target, embed))
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for target, result in zip(webhook_targets, results):
             if isinstance(result, discord.HTTPException) and result.status == 429:
-                retry_after = getattr(result, "retry_after", 1)
+                retry_after = float(getattr(result, "retry_after", 1) or 1)
+                self._target_backoff_until[target.name] = self._clock() + retry_after + 1.0
                 logging.warning(
-                    "Discord rate limited target %s; backing off for %.2fs",
+                    "Discord rate limited target %s; backing off that target for %.2fs",
                     target.name,
                     retry_after,
                 )
-                self.rate_limited = True
-                await asyncio.sleep(retry_after + 1)
-                self.rate_limited = False
             elif isinstance(result, Exception):
                 logging.error("Webhook send failed for %s: %s", target.name, result)
 
-    async def _send_to_target(self, target, embed):
+    async def _noop_skip(self, name):
+        logging.warning("Skipping Discord target %s while rate limit is active", name)
+
+    async def _send_discord(self, target, embed):
         webhook = Webhook.from_url(target.url, session=self.session)
         content = f"<@&{target.role_id}>" if target.role_id else None
         await webhook.send(content=content, embed=embed)
+
+    async def _send_generic(self, target, payload):
+        async with self.session.post(
+            target.url,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=GENERIC_WEBHOOK_TIMEOUT_SECONDS),
+        ) as response:
+            if response.status < 200 or response.status >= 300:
+                body = await response.text()
+                raise RuntimeError(
+                    f"generic webhook {target.name} HTTP {response.status}: {body[:200]}"
+                )
 
     def create_embed(self, product_data):
         embed = Embed(title="Amazon Stock Monitor", color=discord.Color.purple())
@@ -279,204 +302,122 @@ class BlinkMonitor:
                 inline=False,
             )
 
-        embed.set_footer(text=f"Blink FNF | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        embed.set_footer(text=f"Amazon Stock Monitor | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         return embed
-
-
-def parse_json(response_data):
-    """Parse the legacy Amazon Ajax response into the monitor product shape."""
-    parsed_list = []
-    try:
-        products = response_data if isinstance(response_data, list) else response_data.get("products", [])
-
-        for product in products:
-            title = product.get("title", "N/A")
-            if isinstance(title, dict):
-                title = title.get("displayString", "N/A")
-
-            price = None
-            offers = product.get("offers") or []
-            if offers:
-                price = offers[0].get("priceInfo", {}).get("price")
-
-            item = {
-                "asin": product.get("asin", "N/A"),
-                "title": title,
-                "in_stock": bool(product.get("canAddToCart", False)),
-                "link": f"https://www.amazon.com/dp/{product.get('asin', '')}",
-                "images": [
-                    img.get("hiRes", {}).get("url")
-                    for img in product.get("productImages", {}).get("images", [])
-                    if img and img.get("hiRes", {}).get("url")
-                ],
-                "price": price,
-                "seller": product.get("seller") or "Amazon.com",
-                "availability": product.get("availability") or {},
-                "source": "ajax",
-            }
-            parsed_list.append(item)
-
-        return parsed_list
-
-    except Exception as exc:
-        logging.error("Parsing error: %s", exc)
-        return []
-
-
-async def get_slate_token(session, proxy_url):
-    try:
-        async with session.get(
-            os.getenv("AMAZON_URL"),
-            headers={"User-Agent": get_random_user_agent()},
-            proxy=proxy_url,
-            timeout=5,
-        ) as response:
-            response.raise_for_status()
-            text = await response.text()
-            match = re.search(r'"slateToken"\s*:\s*"([^"]+)"', text)
-            return match.group(1) if match else None
-    except Exception as exc:
-        logging.error("Failed to get slate token: %s", exc)
-        return None
-
-
-async def check_stock_ajax(session, asins, proxy_url):
-    """Check stock with the legacy Ajax endpoint in batches of at most 25 ASINs."""
-    results = []
-    for start in range(0, len(asins), 25):
-        batch = asins[start : start + 25]
-        session_id = (
-            f"{random.randint(100, 999)}-"
-            f"{random.randint(10 ** 6, 10 ** 7 - 1)}-"
-            f"{random.randint(10 ** 6, 10 ** 7 - 1)}"
-        )
-        data = {
-            "requestContext": {
-                "obfuscatedMarketplaceId": os.getenv("MARKETPLACE_ID"),
-                "obfuscatedMerchantId": os.getenv("MERCHANT_ID"),
-                "language": "en-US",
-                "sessionId": session_id,
-                "currency": "USD",
-                "amazonApiAjaxEndpoint": "data.amazon.com",
-                "slateToken": await get_slate_token(session, proxy_url),
-            },
-            "content": {"includeOutOfStock": False},
-            "includeOutOfStock": True,
-            "endpoint": "ajax-data",
-            "ASINList": batch,
-        }
-        headers = {
-            "User-Agent": get_random_user_agent(),
-            "Accept": "application/json",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Content-Type": "application/json",
-            "Origin": "https://www.amazon.com",
-            "Referer": "https://www.amazon.com/",
-        }
-
-        try:
-            async with session.post(
-                os.getenv("AMAZON_ENDPOINT"),
-                headers=headers,
-                json=data,
-                proxy=proxy_url,
-                timeout=5,
-            ) as response:
-                response.raise_for_status()
-                response_data = await response.json()
-                results.extend(parse_json(response_data))
-        except aiohttp.ClientError as exc:
-            logging.error("Ajax request failed for ASIN batch %s: %s", batch, exc)
-        except json.JSONDecodeError:
-            logging.error("Failed to parse Ajax JSON response for ASIN batch %s", batch)
-        except Exception as exc:
-            logging.error("Unexpected Ajax stock check error for batch %s: %s", batch, exc)
-
-    return results
-
-
-async def poll_group(session, config, group, tvss_client, proxy_url):
-    if config.backend == "tvss":
-        return await tvss_client.products(session, group.asins)
-    return await check_stock_ajax(session, group.asins, proxy_url)
 
 
 def selected_webhook_targets(group, webhook_targets):
     return [webhook_targets[name] for name in group.webhook_names]
 
 
-def cycle_sleep_seconds(config, failure_count):
+def asin_backoff_seconds(base_seconds, failure_count):
     if failure_count <= 0:
-        return config.poll_interval_seconds
+        return base_seconds
     return min(
-        max(config.poll_interval_seconds, 1.0) * (2 ** min(failure_count - 1, 5)),
+        max(base_seconds, 1.0) * (2 ** min(failure_count - 1, 5)),
         MAX_BACKOFF_SECONDS,
     )
 
 
-async def run_monitor(config, webhook_targets):
-    tvss_client = None
-    proxy_url = build_proxy_url()
+def auth_expired_alert_payload():
+    return {
+        "asin": "N/A",
+        "title": "TVSS auth expired",
+        "in_stock": False,
+        "link": "",
+        "images": [],
+        "price": None,
+        "seller": "monitor",
+        "source": "monitor",
+        "availability": {
+            "primaryMessage": "Refresh TVSS_COOKIE_HEADER (and TVSS_ACCESS_TOKEN if set) and redeploy.",
+        },
+    }
 
-    if config.backend == "tvss":
-        try:
-            tvss_client = TVSSClient()
-        except TVSSConfigError as exc:
-            logging.error("TVSS configuration error: %s", exc)
-            return
 
-    logging.info(
-        "Starting monitor backend=%s groups=%s asins=%s poll_interval=%.2fs",
-        config.backend,
-        len(config.groups),
-        sum(len(group.asins) for group in config.groups),
-        config.poll_interval_seconds,
-    )
+class AuthFailureWatch:
+    """Trips when no successful poll has happened within `grace_seconds`
+    AND at least one auth failure has been observed in that window.
 
-    state = AlertState()
-    cycle_number = 0
+    Designed for per-ASIN concurrent polling: any successful poll on any
+    ASIN resets the watch, while any auth failure flags the watch as
+    "armed". This separates true credential expiry (every ASIN auth-fails)
+    from intermittent network errors (no auth-fail flag set).
+    """
+
+    def __init__(self, grace_seconds=30.0, clock=None):
+        self._grace = float(grace_seconds)
+        self._clock = clock or time.monotonic
+        self._last_success = self._clock()
+        self._auth_failure_seen = False
+
+    def record_success(self):
+        self._last_success = self._clock()
+        self._auth_failure_seen = False
+
+    def record_auth_failure(self):
+        self._auth_failure_seen = True
+
+    def record_other_failure(self):
+        return
+
+    def is_tripped(self):
+        return (
+            self._auth_failure_seen
+            and (self._clock() - self._last_success) > self._grace
+        )
+
+
+async def poll_asin_loop(
+    asin,
+    group,
+    tvss_client,
+    session,
+    state,
+    dispatcher,
+    targets,
+    auth_watch,
+    semaphore,
+    config,
+    shutdown_event,
+    auth_expired_event,
+):
     failure_count = 0
+    while not shutdown_event.is_set():
+        product = None
+        try:
+            async with semaphore:
+                product = await tvss_client.product(session, asin)
+            auth_watch.record_success()
+            failure_count = 0
+        except TVSSConfigError as exc:
+            auth_watch.record_auth_failure()
+            failure_count += 1
+            logging.error("ASIN %s auth failure: %s", asin, exc)
+            if auth_watch.is_tripped():
+                auth_expired_event.set()
+                return
+        except Exception as exc:
+            auth_watch.record_other_failure()
+            failure_count += 1
+            logging.error("ASIN %s poll failed: %s", asin, exc)
 
-    async with aiohttp.ClientSession() as session:
-        monitor = BlinkMonitor(session)
-        while True:
-            cycle_number += 1
-            cycle_failed = False
-            logging.info("Poll cycle %s started", cycle_number)
-
-            for group in config.groups:
-                try:
-                    products = await poll_group(session, config, group, tvss_client, proxy_url)
-                except TVSSConfigError as exc:
-                    cycle_failed = True
-                    logging.error("TVSS authentication/configuration error: %s", exc)
-                    continue
-                except Exception as exc:
-                    cycle_failed = True
-                    logging.error("Poll failed for group %s: %s", group.name, exc)
-                    continue
-
-                if not products:
-                    cycle_failed = True
-                    logging.warning("Group %s returned no products", group.name)
-                    continue
-
-                products_by_asin = {}
-                error_count = 0
-                for product in products:
-                    asin = product.get("asin", "UNKNOWN_ASIN")
-                    products_by_asin[asin] = product
-                    if product.get("error"):
-                        error_count += 1
-                        logging.error(
-                            "ASIN %s check failed via %s: %s",
-                            asin,
-                            product.get("source", config.backend),
-                            product.get("error"),
-                        )
-                        continue
-
-                    in_stock = bool(product.get("in_stock"))
+        if product is not None:
+            try:
+                in_stock_raw = bool(product.get("in_stock"))
+                in_stock = in_stock_raw
+                if (
+                    config.require_amazon_seller
+                    and in_stock_raw
+                    and not product.get("soldByAmazon")
+                ):
+                    in_stock = False
+                    logging.info(
+                        "Group %s ASIN %s: IN_STOCK_FILTERED (third-party seller)",
+                        group.name,
+                        asin,
+                    )
+                else:
                     logging.info(
                         "Group %s ASIN %s: %s",
                         group.name,
@@ -484,36 +425,118 @@ async def run_monitor(config, webhook_targets):
                         "IN_STOCK" if in_stock else "OUT_OF_STOCK",
                     )
 
-                    if state.observe(asin, in_stock):
-                        logging.info("ASIN %s restock detected; sending alerts", asin)
-                        await monitor.send_notification(
-                            product,
-                            selected_webhook_targets(group, webhook_targets),
-                        )
+                if state.observe(asin, in_stock):
+                    logging.info("ASIN %s restock detected; sending alerts", asin)
+                    await dispatcher.send_notification(
+                        product, targets, group_name=group.name
+                    )
+            except Exception as exc:
+                logging.exception("Error processing ASIN %s: %s", asin, exc)
 
-                missing_asins = set(group.asins) - set(products_by_asin.keys())
-                for asin in sorted(missing_asins):
-                    logging.error("Group %s ASIN %s: MISSING_FROM_RESPONSE", group.name, asin)
+        sleep_for = asin_backoff_seconds(config.poll_interval_seconds, failure_count)
+        if failure_count:
+            logging.warning(
+                "ASIN %s backing off for %.2fs (failure_count=%s)",
+                asin,
+                sleep_for,
+                failure_count,
+            )
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_for)
+            return
+        except asyncio.TimeoutError:
+            pass
 
-                if error_count == len(products):
-                    cycle_failed = True
 
-                logging.info(
-                    "Group %s complete: %s/%s ASINs returned",
-                    group.name,
-                    len(products_by_asin),
-                    len(group.asins),
-                )
+async def run_monitor(config, webhook_targets):
+    try:
+        tvss_client = TVSSClient()
+    except TVSSConfigError as exc:
+        logging.error("TVSS configuration error: %s", exc)
+        return
 
-            failure_count = failure_count + 1 if cycle_failed else 0
-            sleep_seconds = cycle_sleep_seconds(config, failure_count)
-            if failure_count:
-                logging.warning(
-                    "Poll cycle %s completed with errors; backing off for %.2fs",
-                    cycle_number,
-                    sleep_seconds,
-                )
-            await asyncio.sleep(sleep_seconds)
+    all_pairs = [(group, asin) for group in config.groups for asin in group.asins]
+    total_asins = len(all_pairs)
+    concurrency = max(
+        1, min(total_asins, int(os.getenv("TVSS_CONCURRENCY", "5")))
+    )
+    grace_seconds = float(os.getenv("AUTH_FAILURE_GRACE_SECONDS", "30"))
+
+    logging.info(
+        "Starting monitor groups=%s asins=%s poll_interval=%.2fs concurrency=%s "
+        "require_amazon_seller=%s auth_grace=%.0fs",
+        len(config.groups),
+        total_asins,
+        config.poll_interval_seconds,
+        concurrency,
+        config.require_amazon_seller,
+        grace_seconds,
+    )
+
+    state = AlertState()
+    auth_watch = AuthFailureWatch(grace_seconds=grace_seconds)
+    semaphore = asyncio.Semaphore(concurrency)
+    shutdown_event = asyncio.Event()
+    auth_expired_event = asyncio.Event()
+
+    async with aiohttp.ClientSession() as session:
+        dispatcher = AlertDispatcher(session)
+
+        poll_tasks = [
+            asyncio.create_task(
+                poll_asin_loop(
+                    asin,
+                    group,
+                    tvss_client,
+                    session,
+                    state,
+                    dispatcher,
+                    selected_webhook_targets(group, webhook_targets),
+                    auth_watch,
+                    semaphore,
+                    config,
+                    shutdown_event,
+                    auth_expired_event,
+                ),
+                name=f"poll-{asin}",
+            )
+            for group, asin in all_pairs
+        ]
+        auth_waiter = asyncio.create_task(
+            auth_expired_event.wait(), name="auth-waiter"
+        )
+
+        try:
+            await asyncio.wait(
+                [auth_waiter, *poll_tasks],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            shutdown_event.set()
+
+        if auth_expired_event.is_set():
+            logging.error(
+                "TVSS auth grace exceeded (%.0fs); sending alert and exiting",
+                grace_seconds,
+            )
+            all_targets = list(webhook_targets.values())
+            if all_targets:
+                try:
+                    await dispatcher.send_notification(
+                        auth_expired_alert_payload(),
+                        all_targets,
+                        group_name="monitor",
+                    )
+                except Exception as exc:
+                    logging.error("Failed to send auth-expiry alert: %s", exc)
+
+        for task in [auth_waiter, *poll_tasks]:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(auth_waiter, *poll_tasks, return_exceptions=True)
+
+        if auth_expired_event.is_set():
+            sys.exit(1)
 
 
 async def main():
