@@ -1,5 +1,6 @@
 API.env
 *.env
+auth.json
 agents.md
 __pycache__/
 *.pyc

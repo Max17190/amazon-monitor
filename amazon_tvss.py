@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import re
 from decimal import Decimal, InvalidOperation
 from urllib.parse import urlencode
@@ -22,25 +21,66 @@ class TVSSConfigError(RuntimeError):
 
 
 class TVSSClient:
-    """Minimal Amazon TVSS client for ASIN inventory monitoring."""
+    """Minimal Amazon TVSS client for ASIN inventory monitoring.
+
+    All per-request overhead is eliminated at construction time:
+    headers, URL prefix, and timeout are pre-built once.  The only
+    per-request work is a dict copy + one key assignment (request ID)
+    and a single f-string concatenation for the URL.
+    """
 
     def __init__(self):
         self.marketplace_id = os.getenv("TVSS_MARKETPLACE_ID", DEFAULT_MARKETPLACE_ID)
         self.domain = os.getenv("TVSS_DOMAIN", DEFAULT_DOMAIN)
         self.base_url = os.getenv("TVSS_BASE_URL", TVSS_BASE_URL).rstrip("/")
         self.currency = os.getenv("TVSS_CURRENCY", "USD")
-        self.device_udid = os.getenv("TVSS_DEVICE_UDID") or self._random_udid()
+        self.device_udid = os.getenv("TVSS_DEVICE_UDID") or os.urandom(16).hex()
         self.cookie_header = self._load_cookie_header()
+
+        # Fallback: if no env-var cookies, try loading from auth.json
+        # (written by `python main.py login`).
+        if not self.cookie_header:
+            self.cookie_header = self._load_cookie_header_from_auth_state()
+
         self.access_token = os.getenv("TVSS_ACCESS_TOKEN") or self._cookie_value("at-main")
 
         if not self.cookie_header:
             raise TVSSConfigError(
-                "TVSS requires TVSS_COOKIE_HEADER or TVSS_COOKIES_JSON in endpoint.env"
+                "No TVSS credentials found. Run 'python main.py login' to authenticate, "
+                "or set TVSS_COOKIE_HEADER / TVSS_COOKIES_JSON in endpoint.env"
             )
 
-    @staticmethod
-    def _random_udid():
-        return "".join(random.choice("0123456789abcdef") for _ in range(32))
+        # Pre-build the frozen portion of request headers.  Per-request,
+        # only x-amzn-RequestId is swapped via a shallow copy + one write.
+        self._base_headers = {
+            "Cookie": self.cookie_header,
+            "User-Agent": TVSS_USER_AGENT,
+            "x-amz-msh-appid": (
+                "name=ShopTV3P;ver=2000610;device=AFTMM;"
+                f"os=Android_7.1.2;UDID={self.device_udid};tag=mshop-amazon-us-20"
+            ),
+        }
+        if self.access_token:
+            self._base_headers["x-amz-access-token"] = self.access_token
+
+        # Pre-compute URL prefixes so the hot path is a single f-string.
+        self._product_url_prefix = (
+            f"{self.base_url}/marketplaces/{self.marketplace_id}/products/"
+        )
+        self._basicproducts_url_prefix = (
+            f"{self.base_url}/marketplaces/{self.marketplace_id}/basicproducts/"
+        )
+
+        # Parse timeout once.  Split into connect vs read for faster
+        # failure detection: a hung TCP connect is caught in 2 s instead
+        # of waiting for the full timeout, freeing the semaphore slot
+        # for other ASINs.
+        total = float(os.getenv("TVSS_TIMEOUT", "5"))
+        self._timeout = aiohttp.ClientTimeout(
+            total=total,
+            sock_connect=min(total, 2.0),
+            sock_read=total,
+        )
 
     def _load_cookie_header(self):
         cookie_header = os.getenv("TVSS_COOKIE_HEADER") or os.getenv("AMAZON_COOKIE_HEADER")
@@ -64,6 +104,13 @@ class TVSSClient:
                 parts.append(f"{name}={value}")
         return "; ".join(parts)
 
+    def _load_cookie_header_from_auth_state(self):
+        from amazon_auth import load_auth_state, cookies_to_header
+        state = load_auth_state()
+        if state and state.get("state") == "authenticated" and state.get("cookies"):
+            return cookies_to_header(state["cookies"])
+        return ""
+
     def _cookie_value(self, name):
         if not self.cookie_header:
             return ""
@@ -75,6 +122,7 @@ class TVSSClient:
         return ""
 
     def _tvss_url(self, *segments, **params):
+        """General-purpose URL builder.  Not used on the product hot path."""
         path = "/".join(
             [self.base_url, "marketplaces", self.marketplace_id]
             + [str(segment).strip("/") for segment in segments]
@@ -83,54 +131,77 @@ class TVSSClient:
         query.update({k: v for k, v in params.items() if v is not None})
         return f"{path}?{urlencode(query)}"
 
-    def _headers(self, media_type=None):
-        request_id = "".join(random.choice("0123456789ABCDEF") for _ in range(20))
-        headers = {
-            "Accept": "application/json",
-            "Cookie": self.cookie_header,
-            "User-Agent": TVSS_USER_AGENT,
-            "x-amzn-RequestId": request_id,
-            "x-amz-msh-appid": (
-                "name=ShopTV3P;ver=2000610;device=AFTMM;"
-                f"os=Android_7.1.2;UDID={self.device_udid};tag=mshop-amazon-us-20"
-            ),
-        }
-        if self.access_token:
-            headers["x-amz-access-token"] = self.access_token
-        if media_type:
-            headers["Content-Type"] = (
-                'application/vnd.com.amazon.tvss.api+json; '
-                f'type="{media_type}"'
-            )
+    def _headers(self):
+        """Return request headers.  Shallow-copies the pre-built base and
+        stamps a fresh request ID — the only per-request work."""
+        headers = self._base_headers.copy()
+        headers["x-amzn-RequestId"] = os.urandom(10).hex().upper()
         return headers
 
-    async def _request(self, session, method, url, media_type=None, json_body=None):
+    async def _request(self, session, method, url, json_body=None):
         async with session.request(
             method,
             url,
-            headers=self._headers(media_type),
+            headers=self._headers(),
             json=json_body,
-            timeout=aiohttp.ClientTimeout(total=float(os.getenv("TVSS_TIMEOUT", "8"))),
+            timeout=self._timeout,
         ) as response:
-            text = await response.text()
+            body = await response.read()
             if response.status in (401, 403):
                 raise TVSSConfigError(f"TVSS auth rejected with HTTP {response.status}")
             if response.status == 429:
                 raise RuntimeError("TVSS rate limited")
             if response.status < 200 or response.status >= 300:
-                raise RuntimeError(f"TVSS HTTP {response.status}: {text[:300]}")
-            if not text:
+                raise RuntimeError(
+                    f"TVSS HTTP {response.status}: {body[:300]}"
+                )
+            if not body:
                 return None
-            data = json.loads(text)
+            data = json.loads(body)
             return data.get("entity", data) if isinstance(data, dict) else data
 
     async def product(self, session, asin):
-        data = await self._request(
-            session,
-            "GET",
-            self._tvss_url("products", asin),
-        )
+        url = f"{self._product_url_prefix}{asin}?sif_profile=tvss"
+        data = await self._request(session, "GET", url)
         return self._parse_product(data, asin)
+
+    async def batch_products(self, session, asins):
+        """Fetch basic product data for multiple ASINs in one request.
+
+        Returns a dict mapping ASIN to {"has_offer": bool, "price": str|None}.
+        The batch endpoint does NOT include merchantInfo (no soldByAmazon);
+        use the full product() call when a transition is detected.
+        """
+        joined = ",".join(asins)
+        url = f"{self._basicproducts_url_prefix}{joined}?get-deals=false&sif_profile=tvss"
+        data = await self._request(session, "GET", url)
+
+        result = {}
+        products = []
+        if isinstance(data, dict):
+            products = data.get("products", [])
+        elif isinstance(data, list):
+            products = data
+
+        for item in products:
+            if not isinstance(item, dict):
+                continue
+            bp = item.get("basicProduct") or {}
+            bo = item.get("basicOffer") or {}
+            asin = bp.get("asin")
+            if not asin:
+                continue
+            result[asin] = {
+                "has_offer": bool(bo.get("offerId")),
+                "price": bo.get("price"),
+            }
+
+        # Fill in any ASINs that weren't in the response (treat as no offer)
+        for asin in asins:
+            if asin not in result:
+                result[asin] = {"has_offer": False, "price": None}
+
+        return result
 
     def _parse_product(self, data, fallback_asin):
         if not isinstance(data, dict):
