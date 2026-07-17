@@ -1,0 +1,106 @@
+# One-shot TVSS latency probe on a free public-repo ubuntu-latest runner.
+# Personal repo only (Max17190/amazon-monitor). Does not use org resources.
+#
+# Requires repository secret AUTH_JSON (contents of auth.json).
+# Trigger: workflow_dispatch
+
+name: latency-probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      asins:
+        description: "Comma-separated ASINs to try (first in-stock Amazon-sold wins)"
+        required: false
+        default: "B00FLYWNYQ,B07FZ8S74R,B0DT7L98J1"
+      reps:
+        description: "Successful timed reps"
+        required: false
+        default: "5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: latency-probe-personal
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: TVSS E2E latency (ubuntu-latest)
+    runs-on: ubuntu-latest
+    # Hard guard: never run on forks or other remotes accidentally.
+    if: github.repository == 'Max17190/amazon-monitor'
+
+    steps:
+      - name: Repository guard
+        run: |
+          set -euo pipefail
+          echo "repository=${GITHUB_REPOSITORY}"
+          echo "actor=${GITHUB_ACTOR}"
+          echo "ref=${GITHUB_REF}"
+          echo "run_id=${GITHUB_RUN_ID}"
+          if [ "${GITHUB_REPOSITORY}" != "Max17190/amazon-monitor" ]; then
+            echo "Refusing unexpected repository"
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Materialize auth.json from secret
+        env:
+          AUTH_JSON: ${{ secrets.AUTH_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${AUTH_JSON:-}" ]; then
+            echo "AUTH_JSON secret is empty. Set it with: gh secret set AUTH_JSON < auth.json"
+            exit 1
+          fi
+          # Write without echoing secret contents.
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          raw = os.environ["AUTH_JSON"]
+          path = Path("auth.json")
+          path.write_text(raw)
+          path.chmod(0o600)
+          # Validate shape only; never print tokens/cookies.
+          import json
+          data = json.loads(raw)
+          assert data.get("state") == "authenticated", "auth state is not authenticated"
+          assert data.get("cookies"), "auth has no cookies"
+          print("auth.json written (authenticated=true, cookie_count=%d)" % len(data["cookies"]))
+          PY
+
+      - name: Runner location hint
+        run: |
+          set -euo pipefail
+          echo "hostname=$(hostname)"
+          curl -sS --max-time 5 https://ipinfo.io/json || true
+          echo
+          # Safe CloudFront POP check (unauthenticated root)
+          curl -sSI --max-time 10 https://tvss.amazon.com/ | tr -d '\r' | \
+            grep -iE '^(HTTP/|x-amz-cf-pop:|x-cache:|via:|server:)' || true
+
+      - name: Run live E2E latency probe
+        env:
+          LATENCY_ASINS: ${{ inputs.asins }}
+          LATENCY_REPS: ${{ inputs.reps }}
+          TVSS_MARKETPLACE_ID: ATVPDKIKX0DER
+          TVSS_DOMAIN: amazon.com
+          TVSS_CURRENCY: USD
+        run: python latency_e2e.py
+
+      - name: Scrub auth file
+        if: always()
+        run: rm -f auth.json
