@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 load_dotenv("endpoint.env")
 
 from amazon_tvss import TVSSClient  # noqa: E402
-from main import AlertDispatcher, AlertState  # noqa: E402
+from main import AlertDispatcher, AlertState, product_from_batch  # noqa: E402
 from webhooks import WebhookTarget  # noqa: E402
 
 
@@ -34,12 +34,56 @@ DEFAULT_ASINS = (
     "B07FZ8S74R",
     "B0DT7L98J1",
 )
-REPS = int(os.getenv("LATENCY_REPS", "5"))
+REPS = int(os.getenv("LATENCY_REPS", "11"))
 PORT = int(os.getenv("LATENCY_WEBHOOK_PORT", "18765"))
-SPACING = float(os.getenv("LATENCY_SPACING", "1.2"))
+SPACING = float(os.getenv("LATENCY_SPACING", "4.0"))
+RETRY_429 = int(os.getenv("LATENCY_RETRY_429", "5"))
+RETRY_429_BASE = float(os.getenv("LATENCY_RETRY_429_BASE", "12.0"))
+# fast = batch + webhook (MONITOR_FAST_ALERT path); confirm = batch + product + webhook
+LATENCY_MODE = os.getenv("LATENCY_MODE", "fast").strip().lower()
 
 receipts = []
 receipt_event = None
+
+
+def _retryable(exc):
+    msg = str(exc).lower()
+    name = type(exc).__name__.lower()
+    return (
+        "rate limited" in msg
+        or "429" in msg
+        or "timeout" in msg
+        or "timeout" in name
+        or "temporarily" in msg
+        or "connection reset" in msg
+        or "server disconnected" in msg
+    )
+
+
+async def tvss_call(label, coro_factory):
+    """Run a TVSS call; retry on rate limit/timeout. Returns (result, success_ms).
+
+    Timing is only the successful attempt (retry sleeps are not included).
+    """
+    last_exc = None
+    for attempt in range(1, RETRY_429 + 1):
+        t0 = time.perf_counter()
+        try:
+            result = await coro_factory()
+            ms = (time.perf_counter() - t0) * 1000.0
+            return result, ms
+        except Exception as exc:
+            last_exc = exc
+            if _retryable(exc) and attempt < RETRY_429:
+                wait = RETRY_429_BASE * (2 ** (attempt - 1))
+                print(
+                    f"  {label}: {type(exc).__name__} attempt {attempt}/{RETRY_429}; "
+                    f"sleep {wait:.0f}s (retry not counted in latency)"
+                )
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise last_exc
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -78,12 +122,24 @@ def pct(xs, p):
     return xs[k]
 
 
+def safe_proxy_endpoint(proxy_url):
+    """Return host:port only — never credentials."""
+    if not proxy_url:
+        return None
+    raw = proxy_url.strip()
+    if "@" in raw:
+        raw = raw.split("@", 1)[1]
+    if "://" in raw:
+        raw = raw.split("://", 1)[1]
+    return raw.rstrip("/")
+
+
 def stats_line(vals):
     if not vals:
         return "n/a"
     vals = sorted(vals)
     return (
-        f"min={min(vals):.1f} p50={pct(vals, 50):.1f} "
+        f"min={min(vals):.1f} p50={pct(vals, 50):.1f} p95={pct(vals, 95):.1f} "
         f"mean={statistics.mean(vals):.1f} max={max(vals):.1f} ms (n={len(vals)})"
     )
 
@@ -99,9 +155,13 @@ async def wait_receipt(ev, timeout=5.0):
 async def pick_in_stock_asin(client, session, candidates):
     for asin in candidates:
         try:
-            product = await client.product(session, asin)
+            product, _ms = await tvss_call(
+                f"candidate.{asin}",
+                lambda a=asin: client.product(session, a),
+            )
         except Exception as exc:
-            print(f"candidate {asin}: error {type(exc).__name__}")
+            print(f"candidate {asin}: error {type(exc).__name__}: {exc}")
+            await asyncio.sleep(2.0)
             continue
         in_stock = bool(product.get("in_stock"))
         sold = product.get("soldByAmazon")
@@ -112,7 +172,7 @@ async def pick_in_stock_asin(client, session, candidates):
         )
         if in_stock and sold is not False:
             return asin, product
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(1.0)
     return None, None
 
 
@@ -134,6 +194,7 @@ async def run_probe():
         kind="generic",
     )
 
+    proxy_ep = safe_proxy_endpoint(getattr(client, "proxy", None))
     print("=== Live E2E restock-path latency probe ===")
     print(f"host={socket.gethostname()}")
     print(f"runner_name={os.getenv('RUNNER_NAME', '')}")
@@ -141,10 +202,12 @@ async def run_probe():
     print(f"github_run_id={os.getenv('GITHUB_RUN_ID', '')}")
     print(f"tvss_base={client.base_url}")
     print(f"marketplace={client.marketplace_id}")
+    print(f"proxy_active={bool(client.proxy)} proxy_endpoint={proxy_ep or 'none'}")
+    print(f"latency_mode={LATENCY_MODE}")
     print(f"reps={REPS}")
     print()
 
-    # Network floor (no secrets)
+    # Network floor (no secrets). Direct TCP only — not via proxy.
     try:
         tcp_times = []
         for _ in range(5):
@@ -153,7 +216,7 @@ async def run_probe():
             tcp_times.append((time.perf_counter() - t0) * 1000)
             s.close()
         print(
-            f"TCP connect tvss.amazon.com: p50={pct(tcp_times, 50):.1f}ms "
+            f"TCP connect tvss.amazon.com (direct): p50={pct(tcp_times, 50):.1f}ms "
             f"min={min(tcp_times):.1f} max={max(tcp_times):.1f}"
         )
     except Exception as exc:
@@ -161,12 +224,9 @@ async def run_probe():
     print()
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        # Warmup + choose ASIN
-        try:
-            await client.batch_products(session, [candidates[0]])
-        except Exception as exc:
-            print(f"warmup error: {type(exc).__name__}: {exc}")
-        await asyncio.sleep(0.3)
+        # Choose ASIN (product only; avoids extra batch burn before timed reps)
+        print("Cooling 15s before TVSS calls (rate-limit buffer)...")
+        await asyncio.sleep(15.0)
 
         asin, live = await pick_in_stock_asin(client, session, candidates)
         if not asin:
@@ -174,13 +234,13 @@ async def run_probe():
             httpd.shutdown()
             return 2
 
-        batch_check = await client.batch_products(session, [asin])
         print(f"using ASIN={asin}")
-        print(f"batch has_offer={batch_check.get(asin)}")
         print(
             f"live in_stock={live.get('in_stock')} soldByAmazon={live.get('soldByAmazon')} "
             f"price={live.get('price')}"
         )
+        print("Spacing timed reps; sleeping 10s before first timed rep...")
+        await asyncio.sleep(10.0)
         print()
 
         dispatcher = AlertDispatcher(session)
@@ -197,29 +257,35 @@ async def run_probe():
                 print(f"rep {i}: peek did not see transition; skip")
                 continue
 
-            t0 = time.perf_counter()
-
-            t_batch0 = time.perf_counter()
-            batch_result = await client.batch_products(session, [asin])
-            t_batch1 = time.perf_counter()
-            has_offer = batch_result.get(asin, {}).get("has_offer", False)
+            # Time only successful TVSS attempts (retries/sleeps excluded).
+            batch_result, batch_ms = await tvss_call(
+                f"rep{i}.batch",
+                lambda: client.batch_products(session, [asin]),
+            )
+            info = batch_result.get(asin, {})
+            has_offer = info.get("has_offer", False)
             if not has_offer:
                 print(f"rep {i}: batch has_offer=False; skip")
                 await asyncio.sleep(SPACING)
                 continue
 
-            t_prod0 = time.perf_counter()
-            product = await client.product(session, asin)
-            t_prod1 = time.perf_counter()
-
-            if not product.get("in_stock"):
-                print(f"rep {i}: product in_stock=False; skip")
-                await asyncio.sleep(SPACING)
-                continue
-            if product.get("soldByAmazon") is False:
-                print(f"rep {i}: third-party only; would filter")
-                await asyncio.sleep(SPACING)
-                continue
+            product_ms = 0.0
+            if LATENCY_MODE in ("confirm", "full", "two-hop"):
+                product, product_ms = await tvss_call(
+                    f"rep{i}.product",
+                    lambda: client.product(session, asin),
+                )
+                if not product.get("in_stock"):
+                    print(f"rep {i}: product in_stock=False; skip")
+                    await asyncio.sleep(SPACING)
+                    continue
+                if product.get("soldByAmazon") is False:
+                    print(f"rep {i}: third-party only; would filter")
+                    await asyncio.sleep(SPACING)
+                    continue
+            else:
+                # Fast-alert path: notify from batch payload only.
+                product = product_from_batch(asin, info, domain=client.domain)
 
             detected_at = datetime.now(timezone.utc)
             t_wh0 = time.perf_counter()
@@ -227,27 +293,26 @@ async def run_probe():
                 product, [target], group_name="latency-probe", ts=detected_at
             )
             t_wh1 = time.perf_counter()
+            webhook_ms = (t_wh1 - t_wh0) * 1000.0
 
             ok = await wait_receipt(ev, timeout=3.0)
-            t_recv = receipts[-1]["t_recv"] if receipts else None
+            path_ms = batch_ms + product_ms + webhook_ms
 
             row = {
                 "rep": i,
                 "delivered": delivered,
                 "webhook_received": ok,
-                "batch_ms": (t_batch1 - t_batch0) * 1000,
-                "product_ms": (t_prod1 - t_prod0) * 1000,
-                "webhook_send_ms": (t_wh1 - t_wh0) * 1000,
-                "poll_to_webhook_received_ms": (
-                    (t_recv - t0) * 1000 if t_recv is not None else None
-                ),
+                "batch_ms": batch_ms,
+                "product_ms": product_ms,
+                "webhook_send_ms": webhook_ms,
+                "poll_to_webhook_received_ms": path_ms if ok else None,
             }
             results.append(row)
             print(
                 f"rep {i}: batch={row['batch_ms']:6.1f}ms "
                 f"product={row['product_ms']:6.1f}ms "
                 f"webhook={row['webhook_send_ms']:6.1f}ms "
-                f"POLL→WEBHOOK_RECV={row['poll_to_webhook_received_ms']} "
+                f"path={row['poll_to_webhook_received_ms']:.1f}ms "
                 f"delivered={delivered} recv={ok}"
             )
             if receipts:
@@ -271,25 +336,39 @@ async def run_probe():
             httpd.shutdown()
             return 1
 
+        path_vals = [
+            r["poll_to_webhook_received_ms"]
+            for r in results
+            if r["poll_to_webhook_received_ms"] is not None
+        ]
         print(f"ASIN={asin}")
+        print(f"latency_mode={LATENCY_MODE}")
+        print(
+            f"region_hint={os.getenv('RAILWAY_REPLICA_REGION', os.getenv('RAILWAY_ENVIRONMENT_NAME', ''))}"
+        )
         print(f"batch_products:          {stats_line([r['batch_ms'] for r in results])}")
-        print(f"product() confirm:       {stats_line([r['product_ms'] for r in results])}")
+        if LATENCY_MODE in ("confirm", "full", "two-hop"):
+            print(
+                f"product() confirm:       {stats_line([r['product_ms'] for r in results])}"
+            )
         print(
             f"webhook send:            {stats_line([r['webhook_send_ms'] for r in results])}"
         )
-        print(
-            "POLL start → webhook RX: "
-            + stats_line(
-                [
-                    r["poll_to_webhook_received_ms"]
-                    for r in results
-                    if r["poll_to_webhook_received_ms"] is not None
-                ]
-            )
+        path_label = (
+            "detect path (batch+webhook)"
+            if LATENCY_MODE not in ("confirm", "full", "two-hop")
+            else "detect path (batch+product+webhook)"
         )
+        print(f"{path_label}: {stats_line(path_vals)}")
+        if path_vals:
+            print(
+                f"README_NUMBERS mode={LATENCY_MODE} p50_ms={pct(path_vals, 50):.0f} "
+                f"p95_ms={pct(path_vals, 95):.0f} n={len(path_vals)}"
+            )
         print()
         print(
             "Note: excludes poll-interval wait (0..POLL_INTERVAL). "
+            "Retry/backoff waits are excluded from latency. "
             "Local webhook RTT is near zero; Discord would add more."
         )
 

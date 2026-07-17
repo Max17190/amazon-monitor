@@ -1,0 +1,10 @@
+services:
+  monitor:
+    build: .
+    env_file: ./endpoint.env
+    volumes:
+      - ./auth.json:/app/auth.json
+      - ./endpoint.env:/app/endpoint.env:ro
+    restart: unless-stopped
+    command: python main.py
+    stop_grace_period: 30s

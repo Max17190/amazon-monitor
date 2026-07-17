@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from decimal import Decimal, InvalidOperation
@@ -82,6 +83,58 @@ class TVSSClient:
             sock_read=total,
         )
 
+        # Optional outbound proxy (e.g. residential). Never log credentials.
+        # Prefer PROXY_URL; fall back to standard env names.
+        raw_proxy = (
+            os.getenv("PROXY_URL")
+            or os.getenv("HTTPS_PROXY")
+            or os.getenv("HTTP_PROXY")
+            or ""
+        ).strip() or None
+        self._proxy_url = raw_proxy
+        # PROXY_MODE=always|fallback (default fallback when a proxy is configured).
+        # Latency-critical path stays direct; proxy only after 429s when fallback.
+        mode = str(os.getenv("PROXY_MODE", "fallback")).strip().lower()
+        self._proxy_fallback_only = mode not in ("always", "on", "force")
+        if not raw_proxy:
+            self.proxy = None
+        elif self._proxy_fallback_only:
+            self.proxy = None  # direct until enable_proxy_fallback()
+        else:
+            self.proxy = raw_proxy
+
+    @staticmethod
+    def _safe_proxy_endpoint(proxy_url):
+        if not proxy_url:
+            return None
+        raw = proxy_url.strip()
+        if "@" in raw:
+            raw = raw.split("@", 1)[1]
+        if "://" in raw:
+            raw = raw.split("://", 1)[1]
+        return raw.rstrip("/")
+
+    def enable_proxy_fallback(self):
+        """Switch TVSS traffic to PROXY_URL after rate limits. No credential logs."""
+        if not self._proxy_url:
+            return
+        if self.proxy == self._proxy_url:
+            return
+        self.proxy = self._proxy_url
+        logging.warning(
+            "TVSS proxy fallback enabled endpoint=%s",
+            self._safe_proxy_endpoint(self._proxy_url),
+        )
+
+    def disable_proxy_fallback(self):
+        """Return to direct egress when PROXY_MODE=fallback and path is healthy."""
+        if not self._proxy_fallback_only:
+            return
+        if self.proxy is None:
+            return
+        self.proxy = None
+        logging.info("TVSS proxy fallback disabled; using direct egress")
+
     def _load_cookie_header(self):
         cookie_header = os.getenv("TVSS_COOKIE_HEADER") or os.getenv("AMAZON_COOKIE_HEADER")
         if cookie_header:
@@ -145,6 +198,7 @@ class TVSSClient:
             headers=self._headers(),
             json=json_body,
             timeout=self._timeout,
+            proxy=self.proxy,
         ) as response:
             body = await response.read()
             if response.status in (401, 403):
@@ -152,9 +206,8 @@ class TVSSClient:
             if response.status == 429:
                 raise RuntimeError("TVSS rate limited")
             if response.status < 200 or response.status >= 300:
-                raise RuntimeError(
-                    f"TVSS HTTP {response.status}: {body[:300]}"
-                )
+                # Do not dump full body (may contain sensitive fields).
+                raise RuntimeError(f"TVSS HTTP {response.status} (body_len={len(body)})")
             if not body:
                 return None
             data = json.loads(body)
@@ -166,12 +219,21 @@ class TVSSClient:
         return self._parse_product(data, asin)
 
     async def batch_products(self, session, asins):
-        """Fetch basic product data for multiple ASINs in one request.
+        """Fetch basic product data for up to 50 ASINs in one request.
 
         Returns a dict mapping ASIN to {"has_offer": bool, "price": str|None}.
         The batch endpoint does NOT include merchantInfo (no soldByAmazon);
-        use the full product() call when a transition is detected.
+        callers should issue a full product() call when a transition is detected.
+
+        Amazon hard-rejects 51+ ASINs with HTTP 400 (empty body) — the cap
+        was confirmed empirically by bisecting from 50 upward; 51 fails in
+        ~100 ms at the edge layer with no body.
         """
+        if len(asins) > 50:
+            raise ValueError(
+                f"batch_products called with {len(asins)} ASINs; "
+                "Amazon TVSS basicproducts hard-caps at 50 (51+ returns HTTP 400)"
+            )
         joined = ",".join(asins)
         url = f"{self._basicproducts_url_prefix}{joined}?get-deals=false&sif_profile=tvss"
         data = await self._request(session, "GET", url)

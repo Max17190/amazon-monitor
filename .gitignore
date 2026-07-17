@@ -4,3 +4,4 @@ auth.json
 agents.md
 __pycache__/
 *.pyc
+.firecrawl/

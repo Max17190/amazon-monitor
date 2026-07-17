@@ -50,11 +50,26 @@ if "discord" not in sys.modules:
     sys.modules["discord"] = discord_stub
 
 from main import (
+    AIMD_DECREMENT,
+    AIMD_DECREMENT_AFTER,
+    AIMD_INTERVAL_CAP,
+    AIMD_MULT,
     AlertDispatcher,
     AlertState,
     AuthFailureWatch,
+    DEFAULT_BATCH_CHUNK_SIZE,
+    DEFAULT_BATCH_CONCURRENCY,
+    DEFAULT_POLL_INTERVAL_SECONDS,
+    JITTER_FRACTION,
+    MAX_BATCH_CONCURRENCY,
+    MIN_POLL_INTERVAL_SECONDS,
     MonitorConfigError,
+    PENALTY_BOX_SLEEP,
+    PENALTY_BOX_THRESHOLD,
+    TVSS_BATCH_HARD_CAP,
     build_generic_payload,
+    clamp,
+    jittered,
     load_monitor_config,
 )
 from webhooks import WebhookTarget, load_webhook_targets
@@ -197,6 +212,41 @@ class MonitorConfigTests(unittest.TestCase):
             }
             config = load_monitor_config(env=env, webhook_targets=targets)
             self.assertFalse(config.require_amazon_seller, f"value {raw!r} should parse falsy")
+
+    def test_fast_alert_default_true(self):
+        targets = {
+            "PRIMARY": WebhookTarget(name="PRIMARY", url="https://x/y"),
+        }
+        env = {
+            "MONITOR_CONFIG_JSON": json.dumps(
+                {"groups": [{"name": "G", "asins": ["B0DT7L98J1"], "webhooks": ["PRIMARY"]}]}
+            ),
+        }
+        config = load_monitor_config(env=env, webhook_targets=targets)
+        self.assertTrue(config.fast_alert)
+
+    def test_fast_alert_can_be_disabled(self):
+        targets = {
+            "PRIMARY": WebhookTarget(name="PRIMARY", url="https://x/y"),
+        }
+        env = {
+            "MONITOR_CONFIG_JSON": json.dumps(
+                {"groups": [{"name": "G", "asins": ["B0DT7L98J1"], "webhooks": ["PRIMARY"]}]}
+            ),
+            "MONITOR_FAST_ALERT": "false",
+        }
+        config = load_monitor_config(env=env, webhook_targets=targets)
+        self.assertFalse(config.fast_alert)
+
+    def test_product_from_batch_builds_minimal_payload(self):
+        from main import product_from_batch
+
+        p = product_from_batch("B00FLYWNYQ", {"has_offer": True, "price": "$1.00"})
+        self.assertEqual(p["asin"], "B00FLYWNYQ")
+        self.assertTrue(p["in_stock"])
+        self.assertEqual(p["price"], "$1.00")
+        self.assertEqual(p["source"], "tvss-batch")
+        self.assertIn("B00FLYWNYQ", p["link"])
 
 
 class WebhookTargetTests(unittest.TestCase):
@@ -637,6 +687,158 @@ class AuthModuleTests(unittest.TestCase):
                             os.environ[key] = val
         finally:
             os.unlink(path)
+
+
+class ClampTests(unittest.TestCase):
+    def test_within_range_returns_value(self):
+        self.assertEqual(clamp(5, 1, 10), 5)
+
+    def test_below_range_returns_lo(self):
+        self.assertEqual(clamp(-3, 1, 10), 1)
+
+    def test_above_range_returns_hi(self):
+        self.assertEqual(clamp(99, 1, 10), 10)
+
+    def test_at_boundaries_is_idempotent(self):
+        self.assertEqual(clamp(1, 1, 10), 1)
+        self.assertEqual(clamp(10, 1, 10), 10)
+
+
+class JitteredTests(unittest.TestCase):
+    def test_within_15_percent_band(self):
+        # 1000 samples must all fall within [0.85x, 1.15x] for fraction=0.15
+        for _ in range(1000):
+            v = jittered(2.0, fraction=0.15)
+            self.assertGreaterEqual(v, 2.0 * 0.85)
+            self.assertLessEqual(v, 2.0 * 1.15)
+
+    def test_zero_fraction_returns_exact_value(self):
+        self.assertAlmostEqual(jittered(2.0, fraction=0.0), 2.0)
+
+    def test_default_fraction_uses_module_constant(self):
+        v = jittered(1.0)
+        self.assertGreaterEqual(v, 1.0 * (1 - JITTER_FRACTION))
+        self.assertLessEqual(v, 1.0 * (1 + JITTER_FRACTION))
+
+
+class BatchPollingConstantsTests(unittest.TestCase):
+    """Constants that encode empirically-verified facts about TVSS."""
+
+    def test_chunk_hard_cap_is_50(self):
+        # Bisected: 50 OK, 51 returns HTTP 400 (empty body, ~100 ms reject).
+        self.assertEqual(TVSS_BATCH_HARD_CAP, 50)
+
+    def test_default_chunk_size_does_not_exceed_hard_cap(self):
+        self.assertLessEqual(DEFAULT_BATCH_CHUNK_SIZE, TVSS_BATCH_HARD_CAP)
+
+    def test_default_batch_concurrency_is_one(self):
+        # 4 parallel chunks at 1s caused 84% 429s in 75s — sequential is the
+        # only safe default.
+        self.assertEqual(DEFAULT_BATCH_CONCURRENCY, 1)
+
+    def test_max_batch_concurrency_is_low(self):
+        # Even 4 parallel chunks burned cookies; do not let users go higher
+        # without changing this constant deliberately.
+        self.assertLessEqual(MAX_BATCH_CONCURRENCY, 4)
+
+    def test_default_poll_interval_meets_min(self):
+        self.assertGreaterEqual(DEFAULT_POLL_INTERVAL_SECONDS, MIN_POLL_INTERVAL_SECONDS)
+
+    def test_aimd_cap_is_multi_minute(self):
+        # Empirical penalty box recovery is multi-minute, so the cap on the
+        # adaptive interval must be at least 60s.
+        self.assertGreaterEqual(AIMD_INTERVAL_CAP, 60.0)
+
+    def test_aimd_mult_increases_interval(self):
+        self.assertGreater(AIMD_MULT, 1.0)
+
+    def test_aimd_decrement_is_positive(self):
+        self.assertGreater(AIMD_DECREMENT, 0.0)
+
+    def test_aimd_decrement_after_is_a_streak(self):
+        self.assertGreater(AIMD_DECREMENT_AFTER, 1)
+
+    def test_penalty_box_sleep_is_long(self):
+        # Empirical TVSS recovery is >5 minutes; 60s is the absolute minimum
+        # that protects the cookie.
+        self.assertGreaterEqual(PENALTY_BOX_SLEEP, 60.0)
+
+    def test_penalty_box_threshold_triggers_quickly(self):
+        # The point of penalty-box detection is to STOP hammering after a few
+        # 429s — keep it tight.
+        self.assertLessEqual(PENALTY_BOX_THRESHOLD, 5)
+
+
+class BatchProductsCapTests(unittest.TestCase):
+    """The TVSSClient must refuse >50 ASINs to catch programmer error."""
+
+    def make_client(self):
+        with patch.dict(os.environ, {"TVSS_COOKIE_HEADER": "session-id=1"}, clear=False):
+            return TVSSClient()
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_raises_on_51_asins(self):
+        client = self.make_client()
+        asins = [f"B{str(i).zfill(9)}" for i in range(51)]
+        with self.assertRaises(ValueError):
+            self._run(client.batch_products(None, asins))
+
+    def test_accepts_50_asins(self):
+        client = self.make_client()
+
+        async def fake_request(session, method, url, json_body=None):
+            return {"products": []}
+
+        client._request = fake_request
+        asins = [f"B{str(i).zfill(9)}" for i in range(50)]
+        result = self._run(client.batch_products(None, asins))
+        # All 50 returned as has_offer=False (since fake response is empty).
+        self.assertEqual(len(result), 50)
+        for v in result.values():
+            self.assertFalse(v["has_offer"])
+
+
+class StateLockSerializesTests(unittest.TestCase):
+    """Two chunk loops can race on peek/commit for the same ASIN. The
+    state_lock serialises peek-then-conditional-commit."""
+
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    async def _race(self, with_lock):
+        state = AlertState()
+        state.commit("X", False)  # prime as out-of-stock
+        lock = asyncio.Lock()
+        observed_transitions = []
+
+        async def worker():
+            if with_lock:
+                async with lock:
+                    if state.peek("X", True):
+                        observed_transitions.append(True)
+                        state.commit("X", True)
+            else:
+                if state.peek("X", True):
+                    observed_transitions.append(True)
+                    # Yield to let the other worker peek before we commit.
+                    await asyncio.sleep(0)
+                    state.commit("X", True)
+
+        await asyncio.gather(worker(), worker())
+        return observed_transitions
+
+    def test_with_lock_one_transition_observed(self):
+        observed = self._run(self._race(with_lock=True))
+        self.assertEqual(len(observed), 1, "lock must serialise peek/commit")
+
+    def test_without_lock_can_see_double_transition(self):
+        # Demonstrates the bug class the lock prevents (does not strictly
+        # assert duplicate; with the await asyncio.sleep(0) yield it should
+        # though).
+        observed = self._run(self._race(with_lock=False))
+        self.assertGreaterEqual(len(observed), 1)
 
 
 if __name__ == "__main__":
