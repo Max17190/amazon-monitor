@@ -20,6 +20,9 @@ except ImportError:  # pragma: no cover - exercised only before dependencies ins
 MIGRATION_LOCK_ID = 0x415A4D4F4E
 DELIVERY_CLAIM_LOCK_ID = 0x414C455254
 DEFAULT_MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+# PostgreSQL notification payloads must be smaller than 8,000 bytes. UUID
+# delivery IDs fit 200 times in the compact notification envelope (7,819 bytes).
+OUTBOX_NOTIFICATION_DELIVERY_ID_LIMIT = 200
 
 
 class DurableStoreError(RuntimeError):
@@ -111,6 +114,20 @@ def utc_now():
 
 def time_ns_epoch():
     return int(utc_now().timestamp() * 1_000_000)
+
+
+def _outbox_notification_payload(delivery_ids: Iterable[UUID]) -> str:
+    """Encode a bounded, replica-prioritization notification payload."""
+    included = []
+    for delivery_id in delivery_ids:
+        if len(included) == OUTBOX_NOTIFICATION_DELIVERY_ID_LIMIT:
+            break
+        candidate = [*included, str(delivery_id)]
+        payload = json.dumps({"delivery_ids": candidate}, separators=(",", ":"))
+        if len(payload.encode("utf-8")) >= 8_000:
+            break
+        included.append(str(delivery_id))
+    return json.dumps({"delivery_ids": included}, separators=(",", ":"))
 
 
 def _jsonable(value):
@@ -582,10 +599,22 @@ class PostgresStore:
                           AND active.seller_policy_hash=candidate.seller_policy_hash
                           AND active.status IN ('pending', 'leased')
                     ) ON CONFLICT DO NOTHING RETURNING job_id
+                    ), notification_delivery_ids AS (
+                        SELECT delivery_id
+                        FROM inserted_deliveries
+                        ORDER BY delivery_id
+                        LIMIT $6::integer
                     ), notification AS (
                         SELECT pg_notify(
                             'alert_outbox_ready',
-                            '{"delivery_ids":[]}'
+                            (
+                                SELECT '{"delivery_ids":['
+                                    || string_agg(
+                                        '"' || delivery_id::text || '"', ','
+                                    )
+                                    || ']}'
+                                FROM notification_delivery_ids
+                            )
                         ) AS sent
                         WHERE EXISTS (SELECT 1 FROM inserted_deliveries)
                     )
@@ -611,6 +640,7 @@ class PostgresStore:
                     json.dumps(alert_rows),
                     json.dumps(delivery_rows),
                     json.dumps(verification_rows),
+                    OUTBOX_NOTIFICATION_DELIVERY_ID_LIMIT,
                 )
                 state_result = result["state_results"]
                 if isinstance(state_result, str):
@@ -831,7 +861,7 @@ class PostgresStore:
                     if created_delivery_ids:
                         await connection.execute(
                             "SELECT pg_notify('alert_outbox_ready', $1)",
-                            '{"delivery_ids":[]}',
+                            _outbox_notification_payload(created_delivery_ids),
                         )
                 return {
                     "version": next_version,

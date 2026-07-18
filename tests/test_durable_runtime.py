@@ -1,3 +1,4 @@
+import asyncio
 import json
 import inspect
 import os
@@ -11,12 +12,14 @@ from uuid import uuid4
 from amazon_tvss import BatchObservation, ObservationStatus
 from durable_runtime import (
     ConfirmationThrottle,
+    DEFAULT_VERIFICATION_TTL_SECONDS,
     DurableStockCoordinator,
     PostgresOutboxRepository,
     _batch_evidence,
     _batch_product_payload,
     _build_group_maps,
     _leader_supervisor,
+    _outbox_notification_listener,
     validate_durable_configuration,
 )
 from durable_store import ScopeKey
@@ -30,6 +33,7 @@ class FakeStockStore:
         self.rows = {}
         self.transitions = []
         self.verifications = []
+        self.verification_ttls = []
         self.bulk_loads = 0
         self.committed_scopes = []
 
@@ -76,6 +80,7 @@ class FakeStockStore:
         ttl_seconds,
     ):
         self.verifications.append((scope, source_sequence, evidence))
+        self.verification_ttls.append(ttl_seconds)
         return uuid4()
 
     async def commit_stock_decisions(
@@ -170,6 +175,9 @@ class DurableConfigurationTests(unittest.TestCase):
         throttle.consumed()
         self.assertFalse(throttle.due(fast_alert=True))
         self.assertTrue(throttle.due(fast_alert=False))
+
+    def test_fast_alert_default_confirmation_ttl_covers_throttled_window(self):
+        self.assertGreaterEqual(DEFAULT_VERIFICATION_TTL_SECONDS, 65.0)
 
     def test_leader_supervisor_accepts_calibration_authority_arguments(self):
         inspect.signature(_leader_supervisor).bind(
@@ -357,6 +365,136 @@ class DurableStockIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.versions), 2)
         self.assertEqual(len(self.store.rows), 2)
         self.assertEqual(len(self.store.verifications), 1)
+
+    async def test_fast_alert_promotes_short_confirmation_ttl_to_cadence_window(self):
+        self.coordinator.config.fast_alert = True
+        product = {
+            "asin": self.asin, "title": "Product", "images": [], "source": "tvss"
+        }
+        with patch.dict(
+            os.environ,
+            {"STOCK_CONFIRM_TTL_SECONDS": "30", "FAST_ALERT_CONFIRM_EVERY_POLLS": "12"},
+            clear=False,
+        ):
+            for sequence in (1, 2, 3):
+                await self.coordinator.process(
+                    self.evidence(
+                        sequence,
+                        EvidenceSource.BATCH,
+                        offer_explicitly_null=True,
+                        availability_condition="OUT_OF_STOCK",
+                    ),
+                    product,
+                )
+            await self.coordinator.process(
+                self.evidence(
+                    4,
+                    EvidenceSource.BATCH,
+                    offer_id="offer",
+                    availability_condition="IN_STOCK",
+                ),
+                product,
+            )
+        self.assertEqual(self.store.verification_ttls, [65.0])
+
+
+class OutboxNotificationListenerTests(unittest.IsolatedAsyncioTestCase):
+    class Connection:
+        def __init__(self):
+            self.listeners = []
+            self.termination_listeners = []
+            self.removed_listeners = []
+            self.released = False
+
+        async def add_listener(self, channel, callback):
+            self.listeners.append((channel, callback))
+
+        async def remove_listener(self, channel, callback):
+            if self.released:
+                raise AssertionError("listener removed after pool release")
+            self.removed_listeners.append((channel, callback))
+            self.listeners.remove((channel, callback))
+
+        def add_termination_listener(self, callback):
+            self.termination_listeners.append(callback)
+
+        def remove_termination_listener(self, callback):
+            if self.released:
+                raise AssertionError(
+                    "termination listener removed after pool release"
+                )
+            self.termination_listeners.remove(callback)
+
+        def terminate(self):
+            for callback in tuple(self.termination_listeners):
+                callback(self)
+
+    class Pool:
+        def __init__(self, connections):
+            self.connections = iter(connections)
+            self.acquired = []
+
+        def acquire(self):
+            pool = self
+
+            class Acquisition:
+                async def __aenter__(self):
+                    self.connection = next(pool.connections)
+                    pool.acquired.append(self.connection)
+                    return self.connection
+
+                async def __aexit__(self, *_args):
+                    if self.connection.listeners:
+                        raise AssertionError(
+                            "pool released connection with LISTEN callback"
+                        )
+                    if self.connection.termination_listeners:
+                        raise AssertionError(
+                            "pool released connection with termination callback"
+                        )
+                    self.connection.released = True
+                    return False
+
+            return Acquisition()
+
+    async def test_reconnects_and_reregisters_listener_after_connection_loss(self):
+        first = self.Connection()
+        second = self.Connection()
+        store = types.SimpleNamespace(pool=self.Pool([first, second]))
+        stop_event = asyncio.Event()
+        wakeup = types.SimpleNamespace(wake=lambda _ids=(): None)
+        retry_delays = []
+
+        async def retry_wait(_stop_event, seconds):
+            retry_delays.append(seconds)
+
+        task = asyncio.create_task(
+            _outbox_notification_listener(
+                store,
+                wakeup,
+                stop_event,
+                reconnect_initial_seconds=0.25,
+                reconnect_max_seconds=1.0,
+                reconnect_wait=retry_wait,
+            )
+        )
+        for _ in range(20):
+            if first.listeners:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(first.listeners[0][0], "alert_outbox_ready")
+        first.terminate()
+        for _ in range(20):
+            if second.listeners:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(second.listeners[0][0], "alert_outbox_ready")
+        self.assertEqual(retry_delays, [0.25])
+        stop_event.set()
+        await task
+        self.assertEqual(len(second.removed_listeners), 1)
+        self.assertTrue(first.released)
+        self.assertTrue(second.released)
 
 
 class EvidenceAdapterTests(unittest.TestCase):

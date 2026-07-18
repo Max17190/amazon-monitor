@@ -306,7 +306,7 @@ LOG_LEVEL=INFO
 | `ALERT_CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive transient target failures before opening its circuit. |
 | `ALERT_CIRCUIT_OPEN_SECONDS` | `60` | Target circuit open duration. |
 | `ALERT_DEAD_LETTER_RETENTION_DAYS` | `30` | Dead-letter audit retention before cleanup. |
-| `STOCK_CONFIRM_TTL_SECONDS` | `30` | Maximum age for a full-product confirmation job. |
+| `STOCK_CONFIRM_TTL_SECONDS` | `90` | Maximum age for a full-product confirmation job. |
 | `STOCK_OOS_REARM_COUNT` | `2` | Strong, cadence-separated out-of-stock observations required to rearm. Values below two are rejected. |
 | `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics. |
 | `PROXY_URL` | unset | Optional HTTP proxy URL. Credentials are never logged. |

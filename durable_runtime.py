@@ -6,7 +6,7 @@ import logging
 import os
 import signal
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -70,7 +70,10 @@ from stock_state import (
 PRODUCTION_MIN_INTERVAL_SECONDS = 5.0
 DEFAULT_LEASE_TTL_SECONDS = 30.0
 DEFAULT_LEASE_RENEW_SECONDS = 10.0
-DEFAULT_VERIFICATION_TTL_SECONDS = 30.0
+# A fast-alert confirmation is intentionally deferred for up to twelve
+# successful five-second polls. Keep the default comfortably beyond that
+# window so the durable job can still be claimed when its slot arrives.
+DEFAULT_VERIFICATION_TTL_SECONDS = 90.0
 DEFAULT_METRICS_PORT = 9090
 
 
@@ -614,6 +617,33 @@ class DurableStockCoordinator:
             self.policy.fingerprint,
         )
 
+    def confirmation_ttl_seconds(self):
+        """Return a confirmation TTL that survives the fast-alert cadence.
+
+        Fast alerts deliberately defer full-product requests. A configured
+        short TTL must not expire a job before its throttled request slot is
+        reached, while non-fast-alert monitors retain their configured TTL.
+        """
+        configured_ttl = float(
+            os.getenv(
+                "STOCK_CONFIRM_TTL_SECONDS",
+                str(DEFAULT_VERIFICATION_TTL_SECONDS),
+            )
+        )
+        if not self.config.fast_alert:
+            return configured_ttl
+        every_polls = max(
+            1,
+            int(os.getenv("FAST_ALERT_CONFIRM_EVERY_POLLS", "12")),
+        )
+        poll_interval = max(
+            float(self.config.poll_interval_seconds),
+            PRODUCTION_MIN_INTERVAL_SECONDS,
+        )
+        # Include one poll interval of scheduling and request-time slack.
+        minimum_ttl = (every_polls + 1) * poll_interval
+        return max(configured_ttl, minimum_ttl)
+
     async def process(
         self,
         evidence,
@@ -796,12 +826,7 @@ class DurableStockCoordinator:
                         scope,
                         evidence.sequence,
                         asdict(evidence),
-                        ttl_seconds=float(
-                            os.getenv(
-                                "STOCK_CONFIRM_TTL_SECONDS",
-                                str(DEFAULT_VERIFICATION_TTL_SECONDS),
-                            )
-                        ),
+                        ttl_seconds=self.confirmation_ttl_seconds(),
                     )
                 return decision
             except StateConflict:
@@ -829,9 +854,7 @@ class DurableStockCoordinator:
         if len(set(scopes)) != len(scopes):
             raise ValueError("a batch may contain an ASIN only once")
         rearm_count = int(os.getenv("STOCK_OOS_REARM_COUNT", "2"))
-        confirm_ttl = float(
-            os.getenv("STOCK_CONFIRM_TTL_SECONDS", str(DEFAULT_VERIFICATION_TTL_SECONDS))
-        )
+        confirm_ttl = self.confirmation_ttl_seconds()
         for _ in range(4):
             stored_by_scope = await self.store.load_product_states(scopes)
             prepared = []
@@ -1553,17 +1576,88 @@ async def _maintenance_loop(store, metrics, stop_event):
             pass
 
 
-async def _outbox_notification_listener(store, wakeup, stop_event):
+async def _outbox_notification_listener(
+    store,
+    wakeup,
+    stop_event,
+    reconnect_initial_seconds=1.0,
+    reconnect_max_seconds=30.0,
+    reconnect_wait=None,
+):
+    """Keep the outbox LISTEN subscription alive across connection loss."""
     adapter = PostgresOutboxNotificationAdapter(wakeup)
-    async with store.pool.acquire() as connection:
-        def receive(_connection, _pid, _channel, payload):
-            adapter.on_notification(payload)
-
-        await connection.add_listener("alert_outbox_ready", receive)
+    reconnect_wait = reconnect_wait or _wait_for_stop
+    backoff = max(0.0, float(reconnect_initial_seconds))
+    max_backoff = max(backoff, float(reconnect_max_seconds))
+    while not stop_event.is_set():
+        connection_lost = asyncio.Event()
         try:
-            await stop_event.wait()
-        finally:
-            await connection.remove_listener("alert_outbox_ready", receive)
+            async with store.pool.acquire() as connection:
+                listener_registered = False
+                termination_listener_registered = False
+
+                def receive(_connection, _pid, _channel, payload):
+                    adapter.on_notification(payload)
+
+                def connection_terminated(_connection):
+                    connection_lost.set()
+
+                try:
+                    await connection.add_listener(
+                        "alert_outbox_ready",
+                        receive,
+                    )
+                    listener_registered = True
+                    connection.add_termination_listener(connection_terminated)
+                    termination_listener_registered = True
+                    backoff = max(0.0, float(reconnect_initial_seconds))
+
+                    waiters = (
+                        asyncio.create_task(stop_event.wait()),
+                        asyncio.create_task(connection_lost.wait()),
+                    )
+                    try:
+                        await asyncio.wait(
+                            waiters,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for waiter in waiters:
+                            waiter.cancel()
+                        await asyncio.gather(
+                            *waiters,
+                            return_exceptions=True,
+                        )
+                finally:
+                    if listener_registered:
+                        with suppress(Exception):
+                            await connection.remove_listener(
+                                "alert_outbox_ready",
+                                receive,
+                            )
+                    if termination_listener_registered:
+                        with suppress(Exception):
+                            connection.remove_termination_listener(
+                                connection_terminated
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not stop_event.is_set():
+                logging.exception("Outbox notification listener disconnected")
+
+        if stop_event.is_set():
+            break
+        await reconnect_wait(stop_event, backoff)
+        backoff = min(max_backoff, max(0.001, backoff * 2))
+
+
+async def _wait_for_stop(stop_event, seconds):
+    """Wait for either a reconnect delay or a clean shutdown request."""
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
 
 
 async def _connection_warmer(session, targets, metrics, stop_event):

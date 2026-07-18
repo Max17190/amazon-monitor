@@ -12,6 +12,7 @@ import inspect
 import logging
 import random
 import time
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -434,14 +435,37 @@ class AlertDeliveryWorker:
         return len(claimed)
 
     async def _drain(self, *, preferred_delivery_ids: Iterable[str] = ()) -> int:
-        """Drain all due work before waiting, without reusing priority IDs."""
+        """Drain due work, merging committed IDs before each later claim."""
         total = 0
-        preferred = tuple(preferred_delivery_ids)
+        pending_preferred: deque[str] = deque()
+        queued_preferred: set[str] = set()
+
+        def enqueue_preferred(delivery_ids: Iterable[str]) -> None:
+            for delivery_id in delivery_ids:
+                if delivery_id not in queued_preferred:
+                    pending_preferred.append(delivery_id)
+                    queued_preferred.add(delivery_id)
+
+        enqueue_preferred(preferred_delivery_ids)
         while not self._stopping.is_set():
-            claimed = await self.run_once(preferred_delivery_ids=preferred)
+            # Commits can arrive while a prior batch is delivered. Merge them
+            # immediately before every claim, then consume one bounded FIFO
+            # slice. Each ID gets one priority opportunity, so stale or
+            # capacity-blocked IDs cannot grow the SQL parameter throughout a
+            # sustained backlog.
+            enqueue_preferred(self.wakeup.take_preferred_delivery_ids())
+            preferred = tuple(
+                pending_preferred.popleft()
+                for _ in range(min(self.claim_limit, len(pending_preferred)))
+            )
+            queued_preferred.difference_update(preferred)
+            claimed = await self.run_once(
+                preferred_delivery_ids=preferred,
+            )
             total += claimed
-            preferred = ()
             if not claimed:
+                if pending_preferred:
+                    continue
                 return total
         return total
 

@@ -221,10 +221,14 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         scope = ScopeKey("monitor", "market", "B000000001", "policy")
         transition, alert, targets = self.writes()
         received = []
+        visible_delivery_ids = []
         notified = asyncio.Event()
         async with self.store.pool.acquire() as listener:
             def on_notification(_connection, _pid, _channel, payload):
                 received.append(json.loads(payload))
+                visible_delivery_ids.append(asyncio.create_task(
+                    self._visible_delivery_ids(received[-1]["delivery_ids"])
+                ))
                 notified.set()
 
             await listener.add_listener("alert_outbox_ready", on_notification)
@@ -238,12 +242,33 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(notified.wait(), timeout=1.0)
             finally:
                 await listener.remove_listener("alert_outbox_ready", on_notification)
-        self.assertEqual(received, [{"delivery_ids": []}])
+        self.assertEqual(
+            set(received[0]["delivery_ids"]),
+            {str(delivery_id) for delivery_id in result.delivery_ids},
+        )
+        self.assertEqual(len(received), 1)
+        visible = await asyncio.gather(*visible_delivery_ids)
+        self.assertEqual(
+            set(visible[0]),
+            set(received[0]["delivery_ids"]),
+        )
         async with self.store.pool.acquire() as connection:
             self.assertEqual(
                 await connection.fetchval("SELECT COUNT(*) FROM alert_deliveries"),
                 len(result.delivery_ids),
             )
+
+    async def _visible_delivery_ids(self, delivery_ids):
+        async with self.store.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT delivery_id::text
+                FROM alert_deliveries
+                WHERE delivery_id = ANY($1::uuid[])
+                """,
+                delivery_ids,
+            )
+        return [row["delivery_id"] for row in rows]
 
     async def test_batch_commit_uses_bounded_set_based_statements(self):
         scope_one = ScopeKey("monitor", "market", "B000000001", "policy")

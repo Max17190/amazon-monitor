@@ -237,6 +237,98 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await worker._drain(), 2)
         self.assertEqual(sum(call[0] == "success" for call in repository.calls), 2)
 
+    async def test_drain_prioritizes_wakeup_ids_arriving_during_backlog(self):
+        class BacklogOutbox:
+            def __init__(self):
+                self.rows = {
+                    "backlog-first": row(delivery_id="backlog-first"),
+                    "backlog-second": row(delivery_id="backlog-second"),
+                    "committed-one": row(delivery_id="committed-one"),
+                    "committed-two": row(delivery_id="committed-two"),
+                }
+                self.calls = []
+                self.first_claimed = asyncio.Event()
+
+            async def claim_due(self, *, limit, now, lease_seconds, preferred_delivery_ids=None):
+                preferred = tuple(preferred_delivery_ids or ())
+                self.calls.append(preferred)
+                if len(self.calls) == 1:
+                    self.first_claimed.set()
+                    return [self.rows.pop("backlog-first")]
+                for delivery_id in preferred:
+                    if delivery_id in self.rows:
+                        return [self.rows.pop(delivery_id)]
+                if self.rows:
+                    return [self.rows.pop(next(iter(self.rows)))]
+                return []
+
+            async def succeed(self, *_args, **_kwargs): pass
+            async def retry(self, *_args, **_kwargs): pass
+            async def dead_letter(self, *_args, **_kwargs): pass
+
+        class GateSender(Sender):
+            def __init__(self):
+                super().__init__(DeliveryAttempt(True, 204))
+                self.release = asyncio.Event()
+
+            async def send(self, delivery):
+                if delivery.delivery_id == "backlog-first":
+                    await self.release.wait()
+                return await super().send(delivery)
+
+        repository = BacklogOutbox()
+        sender = GateSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=1,
+            clock=lambda: 110,
+        )
+        task = asyncio.create_task(worker._drain())
+        await asyncio.wait_for(repository.first_claimed.wait(), timeout=0.2)
+        worker.wake(["committed-one", "committed-two"])
+        sender.release.set()
+
+        self.assertEqual(await asyncio.wait_for(task, timeout=0.2), 4)
+        self.assertEqual(
+            repository.calls[:4],
+            [(), ("committed-one",), ("committed-two",), ()],
+        )
+
+    async def test_drain_prunes_unclaimable_preferred_ids_during_backlog(self):
+        class StalePreferredOutbox:
+            def __init__(self):
+                self.rows = [
+                    row(delivery_id="backlog-one"),
+                    row(delivery_id="backlog-two"),
+                    row(delivery_id="backlog-three"),
+                ]
+                self.calls = []
+
+            async def claim_due(self, *, limit, now, lease_seconds, preferred_delivery_ids=None):
+                self.calls.append(tuple(preferred_delivery_ids or ()))
+                if not self.rows:
+                    return []
+                return [self.rows.pop(0)]
+
+            async def succeed(self, *_args, **_kwargs): pass
+            async def retry(self, *_args, **_kwargs): pass
+            async def dead_letter(self, *_args, **_kwargs): pass
+
+        repository = StalePreferredOutbox()
+        worker = AlertDeliveryWorker(
+            repository,
+            Sender(DeliveryAttempt(True, 204)),
+            concurrency=1,
+            clock=lambda: 110,
+        )
+
+        self.assertEqual(
+            await worker._drain(preferred_delivery_ids=("stale",)),
+            3,
+        )
+        self.assertEqual(repository.calls, [("stale",), (), (), ()])
+
     async def test_wakeup_claims_preferred_rows_without_waiting_for_fallback_scan(self):
         repository = WakeupOutbox([row(delivery_id="fast")])
         sender = RecordingSender(DeliveryAttempt(True, 204))
