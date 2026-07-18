@@ -33,14 +33,18 @@ DEFAULT_ASINS = (
     "B00FLYWNYQ",  # Instant Pot Duo (often Amazon in-stock)
     "B07FZ8S74R",
     "B0DT7L98J1",
+    "B0DTJFSSZG",
+    "B08N5WRWNW",
+    "B0D1XD1ZV3",
+    "B0C33XXS56",
 )
 REPS = int(os.getenv("LATENCY_REPS", "11"))
 PORT = int(os.getenv("LATENCY_WEBHOOK_PORT", "18765"))
 SPACING = float(os.getenv("LATENCY_SPACING", "4.0"))
 RETRY_429 = int(os.getenv("LATENCY_RETRY_429", "5"))
-RETRY_429_BASE = float(os.getenv("LATENCY_RETRY_429_BASE", "12.0"))
 # fast = batch + webhook (MONITOR_FAST_ALERT path); confirm = batch + product + webhook
 LATENCY_MODE = os.getenv("LATENCY_MODE", "fast").strip().lower()
+LATENCY_BATCH_SIZE = min(20, max(1, int(os.getenv("LATENCY_BATCH_SIZE", "20"))))
 
 receipts = []
 receipt_event = None
@@ -61,26 +65,27 @@ def _retryable(exc):
 
 
 async def tvss_call(label, coro_factory):
-    """Run a TVSS call; retry on rate limit/timeout. Returns (result, success_ms).
-
-    Timing is only the successful attempt (retry sleeps are not included).
-    """
+    """Run one logical TVSS call with retry and cooldown in headline timing."""
     last_exc = None
+    total_started = time.perf_counter()
+    rate_limits = 0
     for attempt in range(1, RETRY_429 + 1):
-        t0 = time.perf_counter()
+        attempt_started = time.perf_counter()
         try:
             result = await coro_factory()
-            ms = (time.perf_counter() - t0) * 1000.0
-            return result, ms
+            success_ms = (time.perf_counter() - attempt_started) * 1000.0
+            total_ms = (time.perf_counter() - total_started) * 1000.0
+            return result, total_ms, success_ms, attempt, rate_limits
         except Exception as exc:
             last_exc = exc
+            if "429" in str(exc) or "rate limit" in str(exc).lower():
+                rate_limits += 1
             if _retryable(exc) and attempt < RETRY_429:
-                wait = RETRY_429_BASE * (2 ** (attempt - 1))
                 print(
                     f"  {label}: {type(exc).__name__} attempt {attempt}/{RETRY_429}; "
-                    f"sleep {wait:.0f}s (retry not counted in latency)"
+                    "credential controller will enforce cadence and cooldown; "
+                    "all time remains in headline latency"
                 )
-                await asyncio.sleep(wait)
                 continue
             raise
     raise last_exc
@@ -122,18 +127,6 @@ def pct(xs, p):
     return xs[k]
 
 
-def safe_proxy_endpoint(proxy_url):
-    """Return host:port only — never credentials."""
-    if not proxy_url:
-        return None
-    raw = proxy_url.strip()
-    if "@" in raw:
-        raw = raw.split("@", 1)[1]
-    if "://" in raw:
-        raw = raw.split("://", 1)[1]
-    return raw.rstrip("/")
-
-
 def stats_line(vals):
     if not vals:
         return "n/a"
@@ -142,6 +135,16 @@ def stats_line(vals):
         f"min={min(vals):.1f} p50={pct(vals, 50):.1f} p95={pct(vals, 95):.1f} "
         f"mean={statistics.mean(vals):.1f} max={max(vals):.1f} ms (n={len(vals)})"
     )
+
+
+def batch_asins(selected_asin):
+    configured = [
+        value.strip().upper()
+        for value in os.getenv("LATENCY_BATCH_ASINS", "").split(",")
+        if len(value.strip()) == 10 and value.strip().isalnum()
+    ]
+    values = [selected_asin, *configured]
+    return list(dict.fromkeys(values))[:LATENCY_BATCH_SIZE]
 
 
 async def wait_receipt(ev, timeout=5.0):
@@ -155,13 +158,25 @@ async def wait_receipt(ev, timeout=5.0):
 async def pick_in_stock_asin(client, session, candidates):
     for asin in candidates:
         try:
-            product, _ms = await tvss_call(
-                f"candidate.{asin}",
-                lambda a=asin: client.product(session, a),
+            batch, _total_ms, _success_ms, _attempts, _rate_limits = await tvss_call(
+                f"candidate.{asin}.batch",
+                lambda a=asin: client.batch_products(session, [a]),
             )
         except Exception as exc:
             print(f"candidate {asin}: error {type(exc).__name__}: {exc}")
             await asyncio.sleep(2.0)
+            continue
+        observation = batch[asin]
+        if not observation.has_offer:
+            print(f"candidate {asin}: offer_detected=False")
+            continue
+        try:
+            product, _total_ms, _success_ms, _attempts, _rate_limits = await tvss_call(
+                f"candidate.{asin}.product",
+                lambda a=asin: client.product(session, a),
+            )
+        except Exception as exc:
+            print(f"candidate {asin}: product error {type(exc).__name__}: {exc}")
             continue
         in_stock = bool(product.get("in_stock"))
         sold = product.get("soldByAmazon")
@@ -170,7 +185,7 @@ async def pick_in_stock_asin(client, session, candidates):
             f"candidate {asin}: in_stock={in_stock} soldByAmazon={sold} "
             f"price={product.get('price')} title={title!r}"
         )
-        if in_stock and sold is not False:
+        if observation.has_offer:
             return asin, product
         await asyncio.sleep(1.0)
     return None, None
@@ -187,14 +202,19 @@ async def run_probe():
     httpd = start_server()
     loop = asyncio.get_running_loop()
     client = TVSSClient()
-    connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300, keepalive_timeout=60)
+    client.configure_rate_controller(SPACING)
+    connector = aiohttp.TCPConnector(
+        limit=0,
+        ttl_dns_cache=300,
+        keepalive_timeout=120,
+    )
     target = WebhookTarget(
         name="LOCAL",
         url=f"http://127.0.0.1:{PORT}/restock",
         kind="generic",
     )
 
-    proxy_ep = safe_proxy_endpoint(getattr(client, "proxy", None))
+    route_id = client.proxy_pool.primary_route.route_id
     print("=== Live E2E restock-path latency probe ===")
     print(f"host={socket.gethostname()}")
     print(f"runner_name={os.getenv('RUNNER_NAME', '')}")
@@ -202,7 +222,10 @@ async def run_probe():
     print(f"github_run_id={os.getenv('GITHUB_RUN_ID', '')}")
     print(f"tvss_base={client.base_url}")
     print(f"marketplace={client.marketplace_id}")
-    print(f"proxy_active={bool(client.proxy)} proxy_endpoint={proxy_ep or 'none'}")
+    print(
+        f"proxy_count={client.proxy_pool.proxy_count} "
+        f"initial_route={route_id}"
+    )
     print(f"latency_mode={LATENCY_MODE}")
     print(f"reps={REPS}")
     print()
@@ -235,6 +258,8 @@ async def run_probe():
             return 2
 
         print(f"using ASIN={asin}")
+        monitored_asins = batch_asins(asin)
+        print(f"batch_size={len(monitored_asins)}")
         print(
             f"live in_stock={live.get('in_stock')} soldByAmazon={live.get('soldByAmazon')} "
             f"price={live.get('price')}"
@@ -257,10 +282,16 @@ async def run_probe():
                 print(f"rep {i}: peek did not see transition; skip")
                 continue
 
-            # Time only successful TVSS attempts (retries/sleeps excluded).
-            batch_result, batch_ms = await tvss_call(
+            path_started = time.perf_counter()
+            (
+                batch_result,
+                batch_total_ms,
+                batch_success_ms,
+                batch_attempts,
+                batch_rate_limits,
+            ) = await tvss_call(
                 f"rep{i}.batch",
-                lambda: client.batch_products(session, [asin]),
+                lambda: client.batch_products(session, monitored_asins),
             )
             info = batch_result.get(asin, {})
             has_offer = info.get("has_offer", False)
@@ -269,9 +300,14 @@ async def run_probe():
                 await asyncio.sleep(SPACING)
                 continue
 
-            product_ms = 0.0
             if LATENCY_MODE in ("confirm", "full", "two-hop"):
-                product, product_ms = await tvss_call(
+                (
+                    product,
+                    product_total_ms,
+                    product_success_ms,
+                    product_attempts,
+                    product_rate_limits,
+                ) = await tvss_call(
                     f"rep{i}.product",
                     lambda: client.product(session, asin),
                 )
@@ -286,6 +322,10 @@ async def run_probe():
             else:
                 # Fast-alert path: notify from batch payload only.
                 product = product_from_batch(asin, info, domain=client.domain)
+                product_total_ms = 0.0
+                product_success_ms = 0.0
+                product_attempts = 0
+                product_rate_limits = 0
 
             detected_at = datetime.now(timezone.utc)
             t_wh0 = time.perf_counter()
@@ -296,21 +336,29 @@ async def run_probe():
             webhook_ms = (t_wh1 - t_wh0) * 1000.0
 
             ok = await wait_receipt(ev, timeout=3.0)
-            path_ms = batch_ms + product_ms + webhook_ms
+            path_ms = (time.perf_counter() - path_started) * 1000.0
 
             row = {
                 "rep": i,
                 "delivered": delivered,
                 "webhook_received": ok,
-                "batch_ms": batch_ms,
-                "product_ms": product_ms,
+                "batch_total_ms": batch_total_ms,
+                "batch_success_ms": batch_success_ms,
+                "batch_attempts": batch_attempts,
+                "batch_429s": batch_rate_limits,
+                "product_total_ms": product_total_ms,
+                "product_success_ms": product_success_ms,
+                "product_attempts": product_attempts,
+                "product_429s": product_rate_limits,
                 "webhook_send_ms": webhook_ms,
                 "poll_to_webhook_received_ms": path_ms if ok else None,
             }
             results.append(row)
             print(
-                f"rep {i}: batch={row['batch_ms']:6.1f}ms "
-                f"product={row['product_ms']:6.1f}ms "
+                f"rep {i}: batch_total={row['batch_total_ms']:8.1f}ms "
+                f"batch_success={row['batch_success_ms']:6.1f}ms "
+                f"attempts={row['batch_attempts']} 429s={row['batch_429s']} "
+                f"product_total={row['product_total_ms']:8.1f}ms "
                 f"webhook={row['webhook_send_ms']:6.1f}ms "
                 f"path={row['poll_to_webhook_received_ms']:.1f}ms "
                 f"delivered={delivered} recv={ok}"
@@ -346,10 +394,18 @@ async def run_probe():
         print(
             f"region_hint={os.getenv('RAILWAY_REPLICA_REGION', os.getenv('RAILWAY_ENVIRONMENT_NAME', ''))}"
         )
-        print(f"batch_products:          {stats_line([r['batch_ms'] for r in results])}")
+        print(
+            "batch logical total:     "
+            f"{stats_line([r['batch_total_ms'] for r in results])}"
+        )
+        print(
+            "batch successful attempt:"
+            f" {stats_line([r['batch_success_ms'] for r in results])}"
+        )
         if LATENCY_MODE in ("confirm", "full", "two-hop"):
             print(
-                f"product() confirm:       {stats_line([r['product_ms'] for r in results])}"
+                "product logical total:   "
+                f"{stats_line([r['product_total_ms'] for r in results])}"
             )
         print(
             f"webhook send:            {stats_line([r['webhook_send_ms'] for r in results])}"
@@ -361,14 +417,17 @@ async def run_probe():
         )
         print(f"{path_label}: {stats_line(path_vals)}")
         if path_vals:
+            total_429 = sum(r["batch_429s"] + r["product_429s"] for r in results)
             print(
                 f"README_NUMBERS mode={LATENCY_MODE} p50_ms={pct(path_vals, 50):.0f} "
-                f"p95_ms={pct(path_vals, 95):.0f} n={len(path_vals)}"
+                f"p95_ms={pct(path_vals, 95):.0f} n={len(path_vals)} "
+                f"rate_limits={total_429}"
             )
         print()
         print(
             "Note: excludes poll-interval wait (0..POLL_INTERVAL). "
-            "Retry/backoff waits are excluded from latency. "
+            "Retry and credential cooldown time are included in headline latency. "
+            "Successful-attempt latency is diagnostic only. "
             "Local webhook RTT is near zero; Discord would add more."
         )
 

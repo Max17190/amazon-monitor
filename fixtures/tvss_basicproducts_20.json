@@ -1,0 +1,26 @@
+{
+  "entity": {
+    "products": [
+      {"basicProduct": {"asin": "B000000001", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000002", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000003", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000004", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000005", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000006", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000007", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000008", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000009", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000010", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000011", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000012", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000013", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000014", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000015", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000016", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000017", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000018", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000019", "availabilityCondition": "OUT_OF_STOCK"}, "basicOffer": {"offerId": null, "price": null}},
+      {"basicProduct": {"asin": "B000000020", "availabilityCondition": "IN_STOCK"}, "basicOffer": {"offerId": "redacted-offer-id", "price": "$199.99"}}
+    ]
+  }
+}

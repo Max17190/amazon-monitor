@@ -1,11 +1,20 @@
+import asyncio
+import contextvars
 import json
 import logging
 import os
 import re
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from enum import Enum
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 
 import aiohttp
+
+from tvss_runtime import CredentialRateController, DIRECT_ROUTE_ID, ProxyPool
 
 
 TVSS_BASE_URL = "https://tvss.amazon.com"
@@ -19,6 +28,99 @@ DEFAULT_DOMAIN = "amazon.com"
 
 class TVSSConfigError(RuntimeError):
     pass
+
+
+class ObservationStatus(str, Enum):
+    IN_STOCK = "IN_STOCK"
+    OUT_OF_STOCK = "OUT_OF_STOCK"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class BatchObservation:
+    asin: str
+    status: ObservationStatus
+    price: object = None
+    availability_condition: object = None
+
+    @property
+    def has_offer(self):
+        return self.status is ObservationStatus.IN_STOCK
+
+    def get(self, key, default=None):
+        if key == "asin":
+            return self.asin
+        if key == "status":
+            return self.status
+        if key == "has_offer":
+            return self.has_offer
+        if key == "price":
+            return self.price
+        if key == "availability_condition":
+            return self.availability_condition
+        return default
+
+    def __getitem__(self, key):
+        value = self.get(key, self)
+        if value is self:
+            raise KeyError(key)
+        return value
+
+
+@dataclass
+class TVSSRequestTiming:
+    request_started_ns: int = 0
+    response_headers_ns: int = 0
+    response_read_ns: int = 0
+    json_decoded_ns: int = 0
+    route_id: str = DIRECT_ROUTE_ID
+    attempts: int = 0
+    credential_queue_ms: float = 0.0
+    cadence_wait_ms: float = 0.0
+    half_open_probe: bool = False
+    status: int = 0
+
+    @property
+    def request_wall_ms(self):
+        end = self.response_read_ns or self.response_headers_ns
+        if not self.request_started_ns or not end:
+            return 0.0
+        return (end - self.request_started_ns) / 1_000_000
+
+    @property
+    def response_read_ms(self):
+        if not self.response_headers_ns or not self.response_read_ns:
+            return 0.0
+        return (self.response_read_ns - self.response_headers_ns) / 1_000_000
+
+    @property
+    def json_decode_ms(self):
+        if not self.response_read_ns or not self.json_decoded_ns:
+            return 0.0
+        return (self.json_decoded_ns - self.response_read_ns) / 1_000_000
+
+
+class BatchPollResult(dict):
+    def __init__(self, observations, timing=None, top_level_errors=False):
+        super().__init__(observations)
+        self.observations = observations
+        self.timing = timing or TVSSRequestTiming()
+        self.top_level_errors = bool(top_level_errors)
+
+
+class TVSSRateLimitError(RuntimeError):
+    def __init__(
+        self,
+        retry_after=None,
+        route_id=DIRECT_ROUTE_ID,
+        request_ms=0.0,
+        timing=None,
+    ):
+        super().__init__("TVSS rate limited with HTTP 429")
+        self.retry_after = retry_after
+        self.route_id = route_id
+        self.request_ms = float(request_ms)
+        self.timing = timing or TVSSRequestTiming()
 
 
 class TVSSClient:
@@ -83,57 +185,44 @@ class TVSSClient:
             sock_read=total,
         )
 
-        # Optional outbound proxy (e.g. residential). Never log credentials.
-        # Prefer PROXY_URL; fall back to standard env names.
-        raw_proxy = (
-            os.getenv("PROXY_URL")
-            or os.getenv("HTTPS_PROXY")
-            or os.getenv("HTTP_PROXY")
-            or ""
-        ).strip() or None
-        self._proxy_url = raw_proxy
-        # PROXY_MODE=always|fallback (default fallback when a proxy is configured).
-        # Latency-critical path stays direct; proxy only after 429s when fallback.
-        mode = str(os.getenv("PROXY_MODE", "fallback")).strip().lower()
-        self._proxy_fallback_only = mode not in ("always", "on", "force")
-        if not raw_proxy:
-            self.proxy = None
-        elif self._proxy_fallback_only:
-            self.proxy = None  # direct until enable_proxy_fallback()
-        else:
-            self.proxy = raw_proxy
-
-    @staticmethod
-    def _safe_proxy_endpoint(proxy_url):
-        if not proxy_url:
-            return None
-        raw = proxy_url.strip()
-        if "@" in raw:
-            raw = raw.split("@", 1)[1]
-        if "://" in raw:
-            raw = raw.split("://", 1)[1]
-        return raw.rstrip("/")
-
-    def enable_proxy_fallback(self):
-        """Switch TVSS traffic to PROXY_URL after rate limits. No credential logs."""
-        if not self._proxy_url:
-            return
-        if self.proxy == self._proxy_url:
-            return
-        self.proxy = self._proxy_url
-        logging.warning(
-            "TVSS proxy fallback enabled endpoint=%s",
-            self._safe_proxy_endpoint(self._proxy_url),
+        try:
+            self.proxy_pool = ProxyPool.from_env()
+        except (TypeError, ValueError) as exc:
+            raise TVSSConfigError(f"invalid proxy configuration: {exc}") from exc
+        self.rate_controller = None
+        self.last_request_timing = TVSSRequestTiming()
+        self._traffic_lock = None
+        self._request_timing = contextvars.ContextVar(
+            f"tvss_request_timing_{id(self)}",
+            default=None,
         )
 
+    @property
+    def proxy(self):
+        """Compatibility surface used by the one-shot latency probe."""
+        return self.proxy_pool.primary_route.url
+
+    def configure_rate_controller(self, interval_seconds):
+        self.rate_controller = CredentialRateController(
+            interval_seconds,
+            max_interval=float(os.getenv("TVSS_MAX_INTERVAL_SECONDS", "120")),
+            cooldown_seconds=float(os.getenv("TVSS_429_COOLDOWN_SECONDS", "90")),
+            success_window=int(os.getenv("TVSS_RECOVERY_SUCCESS_COUNT", "30")),
+            additive_decrease=float(os.getenv("TVSS_INTERVAL_DECREMENT", "0.05")),
+        )
+        return self.rate_controller
+
+    def enable_proxy_fallback(self):
+        """Select the best healthy proxy for the next half-open recovery probe."""
+        route_id = self.proxy_pool.activate_recovery()
+        if route_id:
+            logging.warning("TVSS proxy recovery armed route=%s", route_id)
+        return route_id
+
     def disable_proxy_fallback(self):
-        """Return to direct egress when PROXY_MODE=fallback and path is healthy."""
-        if not self._proxy_fallback_only:
-            return
-        if self.proxy is None:
-            return
-        self.proxy = None
-        logging.info("TVSS proxy fallback disabled; using direct egress")
+        """Return fallback mode to direct egress."""
+        self.proxy_pool.deactivate_recovery()
+        logging.info("TVSS proxy recovery cleared route=direct")
 
     def _load_cookie_header(self):
         cookie_header = os.getenv("TVSS_COOKIE_HEADER") or os.getenv("AMAZON_COOKIE_HEADER")
@@ -191,27 +280,149 @@ class TVSSClient:
         headers["x-amzn-RequestId"] = os.urandom(10).hex().upper()
         return headers
 
-    async def _request(self, session, method, url, json_body=None):
-        async with session.request(
-            method,
-            url,
-            headers=self._headers(),
-            json=json_body,
-            timeout=self._timeout,
-            proxy=self.proxy,
-        ) as response:
-            body = await response.read()
-            if response.status in (401, 403):
-                raise TVSSConfigError(f"TVSS auth rejected with HTTP {response.status}")
-            if response.status == 429:
-                raise RuntimeError("TVSS rate limited")
-            if response.status < 200 or response.status >= 300:
-                # Do not dump full body (may contain sensitive fields).
-                raise RuntimeError(f"TVSS HTTP {response.status} (body_len={len(body)})")
-            if not body:
+    @staticmethod
+    def _retry_after_seconds(raw_value):
+        if not raw_value:
+            return None
+        try:
+            return max(0.0, float(raw_value))
+        except (TypeError, ValueError):
+            try:
+                retry_at = parsedate_to_datetime(str(raw_value))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                return max(
+                    0.0,
+                    (retry_at - datetime.now(timezone.utc)).total_seconds(),
+                )
+            except (TypeError, ValueError, OverflowError):
                 return None
-            data = json.loads(body)
-            return data.get("entity", data) if isinstance(data, dict) else data
+
+    async def _request(self, session, method, url, json_body=None):
+        if self._traffic_lock is None:
+            self._traffic_lock = asyncio.Lock()
+        queued_ns = time.perf_counter_ns()
+        async with self._traffic_lock:
+            queue_ms = (time.perf_counter_ns() - queued_ns) / 1_000_000
+            return await self._request_serialized(
+                session,
+                method,
+                url,
+                json_body=json_body,
+                credential_queue_ms=queue_ms,
+            )
+
+    async def _request_serialized(
+        self,
+        session,
+        method,
+        url,
+        json_body=None,
+        credential_queue_ms=0.0,
+    ):
+        timing = TVSSRequestTiming()
+        timing.credential_queue_ms = credential_queue_ms
+        if self.rate_controller is not None:
+            _, wait_seconds, half_open = await self.rate_controller.acquire()
+            timing.cadence_wait_ms = wait_seconds * 1000.0
+            timing.half_open_probe = half_open
+
+        timing.request_started_ns = time.perf_counter_ns()
+        routes = self.proxy_pool.request_routes()
+        last_network_error = None
+
+        for attempt, route in enumerate(routes, start=1):
+            attempt_started_ns = time.perf_counter_ns()
+            timing.attempts = attempt
+            timing.route_id = route.route_id
+            try:
+                async with session.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    json=json_body,
+                    timeout=self._timeout,
+                    proxy=route.url,
+                ) as response:
+                    timing.response_headers_ns = time.perf_counter_ns()
+                    timing.status = response.status
+                    body = await response.read()
+                    timing.response_read_ns = time.perf_counter_ns()
+                    attempt_ms = (
+                        timing.response_read_ns - attempt_started_ns
+                    ) / 1_000_000
+
+                    if response.status in (401, 403):
+                        self.last_request_timing = timing
+                        raise TVSSConfigError(
+                            f"TVSS auth rejected with HTTP {response.status}"
+                        )
+
+                    if response.status == 429:
+                        retry_after = self._retry_after_seconds(
+                            response.headers.get("Retry-After")
+                        )
+                        if not route.is_direct:
+                            self.proxy_pool.record_failure(
+                                route.route_id,
+                                quarantine_seconds=max(retry_after or 0.0, 90.0),
+                            )
+                        if self.rate_controller is not None:
+                            self.rate_controller.record_rate_limit(retry_after)
+                        self.enable_proxy_fallback()
+                        self.last_request_timing = timing
+                        self._request_timing.set(timing)
+                        raise TVSSRateLimitError(
+                            retry_after=retry_after,
+                            route_id=route.route_id,
+                            request_ms=timing.request_wall_ms,
+                            timing=timing,
+                        )
+
+                    if response.status < 200 or response.status >= 300:
+                        self.last_request_timing = timing
+                        raise RuntimeError(
+                            f"TVSS HTTP {response.status} (body_len={len(body)})"
+                        )
+
+                    self.proxy_pool.record_success(route.route_id, attempt_ms)
+                    if self.rate_controller is not None:
+                        self.rate_controller.record_success()
+
+                    if not body:
+                        timing.json_decoded_ns = timing.response_read_ns
+                        self.last_request_timing = timing
+                        self._request_timing.set(timing)
+                        return None
+
+                    self.last_request_timing = timing
+                    self._request_timing.set(timing)
+                    data = json.loads(body)
+                    timing.json_decoded_ns = time.perf_counter_ns()
+                    self.last_request_timing = timing
+                    self._request_timing.set(timing)
+                    return data.get("entity", data) if isinstance(data, dict) else data
+            except TVSSRateLimitError:
+                raise
+            except TVSSConfigError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                last_network_error = exc
+                self.proxy_pool.record_failure(route.route_id)
+                logging.warning(
+                    "TVSS network failure route=%s attempt=%s",
+                    route.route_id,
+                    attempt,
+                )
+                if attempt >= len(routes):
+                    self.last_request_timing = timing
+                    raise RuntimeError(
+                        f"TVSS network failure after {attempt} route attempt(s)"
+                    ) from exc
+
+        if last_network_error is not None:
+            raise last_network_error
+        raise RuntimeError("TVSS request had no available route")
 
     async def product(self, session, asin):
         url = f"{self._product_url_prefix}{asin}?sif_profile=tvss"
@@ -221,7 +432,7 @@ class TVSSClient:
     async def batch_products(self, session, asins):
         """Fetch basic product data for up to 50 ASINs in one request.
 
-        Returns a dict mapping ASIN to {"has_offer": bool, "price": str|None}.
+        Returns typed observations with IN_STOCK, OUT_OF_STOCK, or UNKNOWN.
         The batch endpoint does NOT include merchantInfo (no soldByAmazon);
         callers should issue a full product() call when a transition is detected.
 
@@ -237,33 +448,82 @@ class TVSSClient:
         joined = ",".join(asins)
         url = f"{self._basicproducts_url_prefix}{joined}?get-deals=false&sif_profile=tvss"
         data = await self._request(session, "GET", url)
+        result = self.parse_batch_response(data, asins)
+        result.timing = self._request_timing.get() or self.last_request_timing
+        return result
 
-        result = {}
+    @staticmethod
+    def parse_batch_response(data, asins):
+        requested = tuple(asins)
+        observations = {
+            asin: BatchObservation(asin=asin, status=ObservationStatus.UNKNOWN)
+            for asin in requested
+        }
+
+        top_level_errors = bool(
+            isinstance(data, dict) and (data.get("errors") or data.get("error"))
+        )
+        if top_level_errors:
+            return BatchPollResult(
+                observations,
+                top_level_errors=True,
+            )
+
         products = []
         if isinstance(data, dict):
             products = data.get("products", [])
         elif isinstance(data, list):
             products = data
 
+        if not isinstance(products, list):
+            return BatchPollResult(observations)
+
         for item in products:
             if not isinstance(item, dict):
                 continue
-            bp = item.get("basicProduct") or {}
-            bo = item.get("basicOffer") or {}
-            asin = bp.get("asin")
-            if not asin:
+            bp = item.get("basicProduct")
+            if not isinstance(bp, dict):
                 continue
-            result[asin] = {
-                "has_offer": bool(bo.get("offerId")),
-                "price": bo.get("price"),
-            }
+            asin = bp.get("asin")
+            if asin not in observations:
+                continue
+            if "basicOffer" not in item:
+                continue
+            basic_offer = item["basicOffer"]
+            availability = bp.get("availabilityCondition")
+            if basic_offer is None:
+                observations[asin] = BatchObservation(
+                    asin=asin,
+                    status=ObservationStatus.OUT_OF_STOCK,
+                    availability_condition=availability,
+                )
+                continue
+            if not isinstance(basic_offer, dict):
+                continue
+            if "offerId" not in basic_offer:
+                continue
 
-        # Fill in any ASINs that weren't in the response (treat as no offer)
-        for asin in asins:
-            if asin not in result:
-                result[asin] = {"has_offer": False, "price": None}
+            status = (
+                ObservationStatus.IN_STOCK
+                if bool(basic_offer.get("offerId"))
+                else ObservationStatus.OUT_OF_STOCK
+            )
+            observations[asin] = BatchObservation(
+                asin=asin,
+                status=status,
+                price=basic_offer.get("price"),
+                availability_condition=availability,
+            )
 
-        return result
+        return BatchPollResult(observations)
+
+    @classmethod
+    def decode_batch_response(cls, body, asins):
+        """Decode response bytes and classify observations for hot-path benchmarks."""
+        data = json.loads(body)
+        if isinstance(data, dict):
+            data = data.get("entity", data)
+        return cls.parse_batch_response(data, asins)
 
     def _parse_product(self, data, fallback_asin):
         if not isinstance(data, dict):
@@ -297,8 +557,9 @@ class TVSSClient:
             "source": "tvss",
             "offerId": offer_id,
             "availability": availability,
-            "seller": merchant.get("merchantName") or "Amazon.com",
+            "seller": merchant.get("merchantName"),
             "soldByAmazon": merchant.get("soldByAmazon"),
+            "seller_verified": bool(merchant.get("merchantName")),
         }
 
     @staticmethod

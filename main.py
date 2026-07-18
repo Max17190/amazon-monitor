@@ -1,7 +1,6 @@
 import asyncio
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -16,7 +15,13 @@ import discord
 from discord import Embed, Webhook
 from dotenv import load_dotenv
 
-from amazon_tvss import TVSSClient, TVSSConfigError
+from amazon_tvss import (
+    BatchObservation,
+    ObservationStatus,
+    TVSSClient,
+    TVSSConfigError,
+    TVSSRateLimitError,
+)
 
 
 load_dotenv("endpoint.env")
@@ -30,31 +35,29 @@ logging.basicConfig(
 
 
 ASIN_RE = re.compile(r"^[A-Z0-9]{10}$")
-DEFAULT_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 MIN_POLL_INTERVAL_SECONDS = 0.5
 MAX_BACKOFF_SECONDS = 60.0
 GENERIC_WEBHOOK_TIMEOUT_SECONDS = 5.0
 WEBHOOK_RETRY_ATTEMPTS = 3
 WEBHOOK_RETRY_BACKOFF_SECONDS = 1.0
 
-# Empirical: TVSS basicproducts batch endpoint hard-caps at 50 ASINs;
-# 51+ returns HTTP 400 with empty body. Per-cookie rate limiting is severe
-# enough that parallel chunks cause 429 storms within seconds — keep
-# concurrency low. See agents.md "Batch polling topology".
+# The lower-level endpoint hard-caps batches at 50. The optimized monitor
+# deliberately accepts one batch of at most 20 ASINs.
 TVSS_BATCH_HARD_CAP = 50
-DEFAULT_BATCH_CHUNK_SIZE = 50
+TVSS_MONITOR_ASIN_CAP = 20
+DEFAULT_BATCH_CHUNK_SIZE = 20
 DEFAULT_BATCH_CONCURRENCY = 1
 MAX_BATCH_CONCURRENCY = 4
 
-# AIMD adaptive polling interval, applied per-chunk-loop.
+# Legacy exports retained for configuration and test compatibility. Active
+# pacing and cooldown behavior lives in CredentialRateController.
 JITTER_FRACTION = 0.15
 AIMD_MULT = 2.0
 AIMD_DECREMENT = 0.05
 AIMD_DECREMENT_AFTER = 30
 AIMD_INTERVAL_CAP = 120.0
 
-# After this many consecutive 429s the chunk parks for PENALTY_BOX_SLEEP
-# seconds — empirical TVSS recovery after sustained 429s is multi-minute.
 PENALTY_BOX_THRESHOLD = 3
 PENALTY_BOX_SLEEP = 90.0
 
@@ -101,6 +104,7 @@ class AlertState:
 
     def __init__(self):
         self._states = {}
+        self._inflight = set()
 
     def peek(self, asin, in_stock):
         in_stock = bool(in_stock)
@@ -115,6 +119,22 @@ class AlertState:
         result = self.peek(asin, in_stock)
         self.commit(asin, in_stock)
         return result
+
+    def reserve_transition(self, asin, status):
+        if status is not ObservationStatus.IN_STOCK:
+            return False
+        if asin in self._inflight or not self.peek(asin, True):
+            return False
+        self._inflight.add(asin)
+        return True
+
+    def finish_transition(self, asin, delivered):
+        if delivered:
+            self.commit(asin, True)
+        self._inflight.discard(asin)
+
+    def has_inflight(self, asin):
+        return asin in self._inflight
 
 
 def parse_poll_interval(env):
@@ -237,7 +257,7 @@ def load_monitor_config(env=None, webhook_targets=None):
 def product_from_batch(asin, batch_info, domain="amazon.com"):
     """Minimal product payload for fast-path alerts (no full product fetch)."""
     price = None
-    if isinstance(batch_info, dict):
+    if isinstance(batch_info, (dict, BatchObservation)):
         price = batch_info.get("price")
     return {
         "asin": asin,
@@ -247,9 +267,13 @@ def product_from_batch(asin, batch_info, domain="amazon.com"):
         "images": [],
         "price": price,
         "source": "tvss-batch",
-        "seller": "Amazon.com",
+        "signal": "offer_detected",
+        "seller_verified": False,
+        "seller": None,
         "soldByAmazon": None,
-        "availability": {"primaryMessage": "Offer detected (batch)"},
+        "availability": {
+            "primaryMessage": "Unconfirmed buyable offer detected"
+        },
     }
 
 
@@ -271,6 +295,8 @@ def build_generic_payload(product_data, group_name=None, ts=None):
         "link": product_data.get("link"),
         "image": images[0] if images else None,
         "seller": product_data.get("seller"),
+        "signal": product_data.get("signal"),
+        "seller_verified": bool(product_data.get("seller_verified")),
         "source": product_data.get("source"),
         "group": group_name,
         "ts": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -287,6 +313,7 @@ class AlertDispatcher:
         self.session = session
         self._clock = clock or time.monotonic
         self._target_backoff_until = {}
+        self.last_ack_ms = 0.0
 
     def _is_target_backed_off(self, target):
         deadline = self._target_backoff_until.get(target.name)
@@ -299,6 +326,8 @@ class AlertDispatcher:
         if not webhook_targets:
             logging.error("No webhook targets selected for ASIN %s", product_data.get("asin"))
             return False
+
+        ack_started_ns = time.perf_counter_ns()
 
         if ts is None:
             ts = datetime.now(timezone.utc)
@@ -333,6 +362,7 @@ class AlertDispatcher:
                 logging.error("Webhook send failed for %s: %s", target.name, result)
             else:
                 delivered += 1
+        self.last_ack_ms = (time.perf_counter_ns() - ack_started_ns) / 1_000_000
         return delivered > 0
 
     async def _noop_skip(self, name):
@@ -414,6 +444,7 @@ class AlertDispatcher:
 
         product_link = product_data.get("link", "")
         product_name = product_data.get("title", "N/A")
+        seller_name = product_data.get("seller") or "Seller unconfirmed"
         product_name_with_link = (
             f"[{product_name}]({product_link})" if product_link else product_name
         )
@@ -425,7 +456,7 @@ class AlertDispatcher:
                 f"**SKU:** {product_data.get('asin', 'N/A')}\n"
                 f"**Price:** {price}\n"
                 f"**Condition:** New\n"
-                f"**Sold By:** {product_data.get('seller') or 'Amazon.com'}\n"
+                f"**Sold By:** {seller_name}\n"
                 f"**Source:** {product_data.get('source', 'tvss')}"
             ),
             inline=False,
@@ -630,78 +661,96 @@ async def _handle_transition(
     Spawned fire-and-forget by `poll_chunk_loop` so the batch tick rate is
     preserved. Holds `state_lock` only across commit.
     """
-    async with transition_semaphore:
-        try:
+    delivered = False
+    owns_reservation = not already_alerted
+    try:
+        async with transition_semaphore:
             product = await tvss_client.product(session, asin)
-        except TVSSConfigError as exc:
-            auth_watch.record_auth_failure()
-            logging.error("ASIN %s full fetch auth failure: %s", asin, exc)
-            if auth_watch.is_tripped():
-                auth_expired_event.set()
-            return
-        except Exception as exc:
-            logging.error("ASIN %s full fetch failed: %s", asin, exc)
+
+        in_stock = bool(product.get("in_stock"))
+        third_party = (
+            config.require_amazon_seller
+            and in_stock
+            and not product.get("soldByAmazon")
+        )
+
+        if already_alerted:
+            if third_party:
+                logging.info(
+                    "ASIN %s: fast-alert already sent; full fetch is third-party "
+                    "seller=%s (not retracting)",
+                    asin,
+                    product.get("seller") or "unknown",
+                )
+            elif not in_stock:
+                logging.info(
+                    "ASIN %s: fast-alert already sent; full fetch now OOS "
+                    "(not retracting)",
+                    asin,
+                )
+            else:
+                logging.debug(
+                    "ASIN %s: fast-alert confirmed by full fetch (seller=%s)",
+                    asin,
+                    product.get("seller") or "unknown",
+                )
             return
 
-    in_stock = bool(product.get("in_stock"))
-    third_party = (
-        config.require_amazon_seller
-        and in_stock
-        and not product.get("soldByAmazon")
-    )
-
-    if already_alerted:
         if third_party:
             logging.info(
-                "ASIN %s: fast-alert already sent; full fetch is third-party "
-                "seller=%s (not retracting)",
+                "ASIN %s: IN_STOCK_FILTERED (third-party seller: %s)",
                 asin,
-                product.get("seller", "unknown"),
+                product.get("seller") or "unknown",
             )
-        elif not in_stock:
-            logging.info(
-                "ASIN %s: fast-alert already sent; full fetch now OOS (not retracting)",
-                asin,
-            )
-        else:
-            logging.debug(
-                "ASIN %s: fast-alert confirmed by full fetch (seller=%s)",
-                asin,
-                product.get("seller", "unknown"),
-            )
-        return
+            async with state_lock:
+                state.commit(asin, False)
+            return
 
-    if third_party:
+        if not in_stock:
+            logging.debug("ASIN %s: OUT_OF_STOCK (full confirm)", asin)
+            async with state_lock:
+                state.commit(asin, False)
+            return
+
+        group = asin_to_group.get(asin)
+        targets = asin_to_targets.get(asin, [])
+        group_name = group.name if group else None
+        detected_at = datetime.now(timezone.utc)
+        product["signal"] = "offer_detected"
+        logging.info("ASIN %s Amazon restock confirmed; sending alerts", asin)
+        webhook_started_ns = time.perf_counter_ns()
+        delivered = await dispatcher.send_notification(
+            product, targets, group_name=group_name, ts=detected_at,
+        )
+        webhook_ack_ms = (
+            time.perf_counter_ns() - webhook_started_ns
+        ) / 1_000_000
         logging.info(
-            "ASIN %s: IN_STOCK_FILTERED (third-party seller: %s)",
-            asin,
-            product.get("seller", "unknown"),
+            "tvss_stage %s",
+            json.dumps(
+                {
+                    "asin": asin,
+                    "webhook_ack_ms": round(webhook_ack_ms, 3),
+                    "seller_verified": bool(product.get("seller_verified")),
+                },
+                separators=(",", ":"),
+            ),
         )
-        async with state_lock:
-            state.commit(asin, False)
-        return
-
-    if not in_stock:
-        logging.debug("ASIN %s: OUT_OF_STOCK (full confirm)", asin)
-        async with state_lock:
-            state.commit(asin, False)
-        return
-
-    group = asin_to_group.get(asin)
-    targets = asin_to_targets.get(asin, [])
-    group_name = group.name if group else None
-    detected_at = datetime.now(timezone.utc)
-    logging.info("ASIN %s Amazon restock confirmed; sending alerts", asin)
-    delivered = await dispatcher.send_notification(
-        product, targets, group_name=group_name, ts=detected_at,
-    )
-    if delivered:
-        async with state_lock:
-            state.commit(asin, True)
-    else:
-        logging.error(
-            "ASIN %s alert delivery failed; will retry next cycle", asin,
-        )
+        if not delivered:
+            logging.error(
+                "ASIN %s alert delivery failed; will retry next cycle", asin
+            )
+    except TVSSConfigError as exc:
+        auth_watch.record_auth_failure()
+        logging.error("ASIN %s full fetch auth failure: %s", asin, exc)
+        if auth_watch.is_tripped():
+            auth_expired_event.set()
+    except Exception as exc:
+        logging.error("ASIN %s full fetch failed: %s", asin, exc)
+    finally:
+        if owns_reservation:
+            async with state_lock:
+                state.finish_transition(asin, delivered)
 
 
 async def _fast_alert_from_batch(
@@ -725,22 +774,41 @@ async def _fast_alert_from_batch(
     group_name = group.name if group else None
     product = product_from_batch(asin, batch_info, domain=tvss_client.domain)
     detected_at = datetime.now(timezone.utc)
-    logging.info("ASIN %s restock detected (fast-alert); sending alerts", asin)
-    delivered = await dispatcher.send_notification(
-        product, targets, group_name=group_name, ts=detected_at,
-    )
-    if not delivered:
-        logging.error(
-            "ASIN %s fast-alert delivery failed; state not committed, will retry",
+    delivered = False
+    try:
+        logging.info(
+            "ASIN %s unconfirmed buyable offer detected; sending fast alert",
             asin,
         )
-        return
+        webhook_started_ns = time.perf_counter_ns()
+        delivered = await dispatcher.send_notification(
+            product, targets, group_name=group_name, ts=detected_at,
+        )
+        webhook_ack_ms = (
+            time.perf_counter_ns() - webhook_started_ns
+        ) / 1_000_000
+        logging.info(
+            "tvss_stage %s",
+            json.dumps(
+                {
+                    "asin": asin,
+                    "webhook_ack_ms": round(webhook_ack_ms, 3),
+                    "signal": "offer_detected",
+                    "seller_verified": False,
+                },
+                separators=(",", ":"),
+            ),
+        )
+        if not delivered:
+            logging.error(
+                "ASIN %s fast-alert delivery failed; state not committed, will retry",
+                asin,
+            )
+    finally:
+        async with state_lock:
+            state.finish_transition(asin, delivered)
 
-    async with state_lock:
-        state.commit(asin, True)
-
-    # Async enrich / seller check — does not block batch loop; does not retract.
-    if config.require_amazon_seller:
+    if delivered:
         await _handle_transition(
             asin,
             asin_to_group,
@@ -775,100 +843,88 @@ async def poll_chunk_loop(
     shutdown_event,
     auth_expired_event,
 ):
-    """Poll one chunk of <=50 ASINs in a loop with per-chunk AIMD interval.
-
-    Concurrency across chunks is gated by `chunk_semaphore` (default 1, since
-    parallel chunks empirically trigger 84% 429s within seconds — the rate
-    limit is per-cookie, not per-chunk). Each chunk maintains its own
-    interval so a 429 on one chunk does not slow the others.
-    """
-    base = config.poll_interval_seconds
-    interval = base
-    consecutive_429 = 0
-    success_streak = 0
-    transition_tasks = []
-
-    # Initial stagger so chunks dephase from t=0.
-    await asyncio.sleep(random.uniform(0, base))
+    """Poll one batch using the client's credential-wide deadline controller."""
+    transition_tasks = set()
 
     while not shutdown_event.is_set():
         batch_result = None
-        penalty_triggered = False
-
-        async with chunk_semaphore:
-            try:
+        try:
+            async with chunk_semaphore:
                 batch_result = await tvss_client.batch_products(session, chunk_asins)
-                consecutive_429 = 0
-                success_streak += 1
-                if success_streak >= AIMD_DECREMENT_AFTER:
-                    interval = max(base, interval - AIMD_DECREMENT)
-                    success_streak = 0
-                    # Prefer direct path again after sustained health.
-                    if hasattr(tvss_client, "disable_proxy_fallback"):
-                        tvss_client.disable_proxy_fallback()
-                auth_watch.record_success()
-            except TVSSConfigError as exc:
-                auth_watch.record_auth_failure()
-                logging.error("chunk%s auth failure: %s", chunk_idx, exc)
-                if auth_watch.is_tripped():
-                    auth_expired_event.set()
-                    break
-            except RuntimeError as exc:
-                msg = str(exc)
-                if "rate limited" in msg or "429" in msg:
-                    consecutive_429 += 1
-                    success_streak = 0
-                    interval = min(interval * AIMD_MULT, AIMD_INTERVAL_CAP)
-                    logging.warning(
-                        "chunk%s 429 (consecutive=%d); interval -> %.2fs",
-                        chunk_idx, consecutive_429, interval,
-                    )
-                    # Optional residential proxy only as 429 fallback (latency path stays direct).
-                    if hasattr(tvss_client, "enable_proxy_fallback"):
-                        tvss_client.enable_proxy_fallback()
-                    if consecutive_429 >= PENALTY_BOX_THRESHOLD:
-                        penalty_triggered = True
-                        consecutive_429 = 0
-                else:
-                    auth_watch.record_other_failure()
-                    logging.error("chunk%s poll failed: %s", chunk_idx, exc)
-            except Exception as exc:
-                auth_watch.record_other_failure()
-                logging.error("chunk%s poll failed: %s", chunk_idx, exc)
+            auth_watch.record_success()
+        except TVSSConfigError as exc:
+            auth_watch.record_auth_failure()
+            logging.error("batch auth failure: %s", exc)
+            if auth_watch.is_tripped():
+                auth_expired_event.set()
+                break
+        except TVSSRateLimitError as exc:
+            controller = tvss_client.rate_controller
+            snapshot = controller.snapshot() if controller else {}
+            timing = exc.timing
+            logging.warning(
+                "tvss_stage %s",
+                json.dumps(
+                    {
+                        "request_wall_ms": round(exc.request_ms, 3),
+                        "active_route": exc.route_id,
+                        "attempts": timing.attempts,
+                        "credential_queue_ms": round(
+                            timing.credential_queue_ms, 3
+                        ),
+                        "cadence_wait_ms": round(timing.cadence_wait_ms, 3),
+                        "rate_limited": True,
+                        "retry_after_seconds": exc.retry_after,
+                        "cooldown_seconds": round(
+                            snapshot.get("blocked_seconds", 0.0), 3
+                        ),
+                        "interval_seconds": snapshot.get("interval_seconds"),
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        except Exception as exc:
+            auth_watch.record_other_failure()
+            logging.error("batch poll failed: %s", exc)
 
         if batch_result is not None:
+            evaluation_started_ns = time.perf_counter_ns()
+            dispatch_scheduling_ns = 0
+            unknown_count = 0
+            transition_count = 0
+
             for asin in chunk_asins:
                 try:
-                    info = batch_result.get(asin, {})
-                    has_offer = info.get("has_offer", False)
+                    observation = batch_result[asin]
+                    if observation.status is ObservationStatus.UNKNOWN:
+                        unknown_count += 1
+                        logging.debug("ASIN %s: UNKNOWN", asin)
+                        continue
 
-                    if not has_offer:
+                    if observation.status is ObservationStatus.OUT_OF_STOCK:
                         async with state_lock:
-                            state.commit(asin, False)
-                        logging.debug("ASIN %s: OUT_OF_STOCK (chunk%s)", asin, chunk_idx)
+                            if not state.has_inflight(asin):
+                                state.commit(asin, False)
+                        logging.debug("ASIN %s: OUT_OF_STOCK", asin)
                         continue
 
                     async with state_lock:
-                        is_transition = state.peek(asin, True)
-                        if not is_transition:
+                        is_transition = state.reserve_transition(
+                            asin, observation.status
+                        )
+                        if not is_transition and not state.has_inflight(asin):
                             state.commit(asin, True)
 
                     if not is_transition:
-                        logging.debug(
-                            "ASIN %s: IN_STOCK (chunk%s, no transition)",
-                            asin, chunk_idx,
-                        )
+                        logging.debug("ASIN %s: IN_STOCK (no transition)", asin)
                         continue
 
+                    schedule_started_ns = time.perf_counter_ns()
                     if config.fast_alert:
-                        logging.info(
-                            "ASIN %s offer detected in chunk%s; fast-alert path",
-                            asin, chunk_idx,
-                        )
                         task = asyncio.create_task(
                             _fast_alert_from_batch(
                                 asin,
-                                info,
+                                observation,
                                 asin_to_group,
                                 asin_to_targets,
                                 tvss_client,
@@ -884,10 +940,6 @@ async def poll_chunk_loop(
                             name=f"fast-alert-{asin}",
                         )
                     else:
-                        logging.info(
-                            "ASIN %s offer detected in chunk%s; spawning transition handler",
-                            asin, chunk_idx,
-                        )
                         task = asyncio.create_task(
                             _handle_transition(
                                 asin,
@@ -905,33 +957,57 @@ async def poll_chunk_loop(
                             ),
                             name=f"transition-{asin}",
                         )
-                    transition_tasks.append(task)
+                    dispatch_scheduling_ns += (
+                        time.perf_counter_ns() - schedule_started_ns
+                    )
+                    transition_count += 1
+                    transition_tasks.add(task)
+                    task.add_done_callback(transition_tasks.discard)
                 except Exception as exc:
+                    async with state_lock:
+                        state.finish_transition(asin, False)
                     logging.exception(
-                        "chunk%s error processing ASIN %s: %s",
-                        chunk_idx, asin, exc,
+                        "batch error processing ASIN %s: %s", asin, exc
                     )
 
-            transition_tasks = [t for t in transition_tasks if not t.done()]
-
-        if penalty_triggered:
-            logging.warning(
-                "chunk%s entering penalty box %.0fs",
-                chunk_idx, PENALTY_BOX_SLEEP,
+            evaluated_ns = time.perf_counter_ns()
+            timing = batch_result.timing
+            controller = tvss_client.rate_controller
+            snapshot = controller.snapshot() if controller else {}
+            internal_ms = (
+                (evaluated_ns - timing.response_read_ns) / 1_000_000
+                if timing.response_read_ns
+                else 0.0
             )
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=PENALTY_BOX_SLEEP)
-                break
-            except asyncio.TimeoutError:
-                pass
-            continue
-
-        sleep_for = jittered(interval)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=sleep_for)
-            break
-        except asyncio.TimeoutError:
-            pass
+            logging.info(
+                "tvss_stage %s",
+                json.dumps(
+                    {
+                        "request_wall_ms": round(timing.request_wall_ms, 3),
+                        "response_read_ms": round(timing.response_read_ms, 3),
+                        "json_decode_ms": round(timing.json_decode_ms, 3),
+                        "state_evaluation_ms": round(
+                            (evaluated_ns - evaluation_started_ns) / 1_000_000,
+                            3,
+                        ),
+                        "dispatch_scheduling_ms": round(
+                            dispatch_scheduling_ns / 1_000_000, 3
+                        ),
+                        "read_to_dispatch_ms": round(internal_ms, 3),
+                        "active_route": timing.route_id,
+                        "attempts": timing.attempts,
+                        "credential_queue_ms": round(
+                            timing.credential_queue_ms, 3
+                        ),
+                        "cadence_wait_ms": round(timing.cadence_wait_ms, 3),
+                        "interval_seconds": snapshot.get("interval_seconds"),
+                        "rate_limited": False,
+                        "unknown_observations": unknown_count,
+                        "scheduled_transitions": transition_count,
+                    },
+                    separators=(",", ":"),
+                ),
+            )
 
     if transition_tasks:
         await asyncio.gather(*transition_tasks, return_exceptions=True)
@@ -954,25 +1030,28 @@ async def run_monitor(config, webhook_targets):
         "0", "false", "no", "off",
     )
 
-    chunk_size = clamp(
-        int(os.getenv("TVSS_BATCH_CHUNK_SIZE", str(DEFAULT_BATCH_CHUNK_SIZE))),
-        1,
-        TVSS_BATCH_HARD_CAP,
-    )
     raw_batch_conc = os.getenv("TVSS_BATCH_CONCURRENCY")
     if raw_batch_conc is None and os.getenv("TVSS_CONCURRENCY") is not None and use_batch:
         logging.warning(
             "TVSS_CONCURRENCY is ignored in batch mode; "
             "set TVSS_BATCH_CONCURRENCY to control parallel chunks."
         )
-    batch_concurrency = clamp(
-        int(raw_batch_conc) if raw_batch_conc is not None else DEFAULT_BATCH_CONCURRENCY,
-        1,
-        MAX_BATCH_CONCURRENCY,
-    )
+    batch_concurrency = DEFAULT_BATCH_CONCURRENCY
+    if raw_batch_conc not in (None, "1"):
+        logging.warning(
+            "TVSS_BATCH_CONCURRENCY=%s ignored; the credential-wide scheduler "
+            "uses one request stream.",
+            raw_batch_conc,
+        )
 
     # Deduplicate ASINs across groups (batch polls each ASIN once)
     all_asins = list(dict.fromkeys(asin for _, asin in all_pairs))
+    if use_batch and len(all_asins) > TVSS_MONITOR_ASIN_CAP:
+        raise MonitorConfigError(
+            f"batch monitor supports at most {TVSS_MONITOR_ASIN_CAP} ASINs"
+        )
+    if use_batch:
+        tvss_client.configure_rate_controller(config.poll_interval_seconds)
     # Map ASIN → first group it belongs to (for group_name in alerts)
     asin_to_group = {}
     asin_to_targets = {}
@@ -981,29 +1060,25 @@ async def run_monitor(config, webhook_targets):
             asin_to_group[asin] = group
             asin_to_targets[asin] = selected_webhook_targets(group, webhook_targets)
 
-    chunks = [
-        all_asins[i : i + chunk_size]
-        for i in range(0, len(all_asins), chunk_size)
-    ]
+    chunks = [all_asins]
 
     mode = "batch" if use_batch else "per-asin"
     if use_batch:
-        per_asin_cadence = math.ceil(len(all_asins) / chunk_size) * config.poll_interval_seconds / max(1, batch_concurrency)
         logging.info(
             "Starting monitor mode=batch groups=%s asins=%s chunks=%s "
             "chunk_size=%s batch_concurrency=%s poll_interval=%.2fs "
             "require_amazon_seller=%s fast_alert=%s auth_grace=%.0fs "
-            "(approx per-ASIN cadence ~%.1fs)",
+            "(target per-ASIN cadence %.1fs)",
             len(config.groups),
             len(all_asins),
             len(chunks),
-            chunk_size,
+            len(all_asins),
             batch_concurrency,
             config.poll_interval_seconds,
             config.require_amazon_seller,
             config.fast_alert,
             grace_seconds,
-            per_asin_cadence,
+            config.poll_interval_seconds,
         )
     else:
         logging.info(
@@ -1047,8 +1122,8 @@ async def run_monitor(config, webhook_targets):
 
     connector = aiohttp.TCPConnector(
         limit=0,
-        ttl_dns_cache=120,
-        keepalive_timeout=30,
+        ttl_dns_cache=300,
+        keepalive_timeout=120,
         enable_cleanup_closed=True,
     )
 
@@ -1104,10 +1179,13 @@ async def run_monitor(config, webhook_targets):
         auth_waiter = asyncio.create_task(
             auth_expired_event.wait(), name="auth-waiter"
         )
+        shutdown_waiter = asyncio.create_task(
+            shutdown_event.wait(), name="shutdown-waiter"
+        )
 
         try:
             await asyncio.wait(
-                [auth_waiter, *poll_tasks],
+                [auth_waiter, shutdown_waiter, *poll_tasks],
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
@@ -1129,10 +1207,12 @@ async def run_monitor(config, webhook_targets):
                 except Exception as exc:
                     logging.error("Failed to send auth-expiry alert: %s", exc)
 
-        for task in [auth_waiter, *poll_tasks]:
+        for task in [auth_waiter, shutdown_waiter, *poll_tasks]:
             if not task.done():
                 task.cancel()
-        await asyncio.gather(auth_waiter, *poll_tasks, return_exceptions=True)
+        await asyncio.gather(
+            auth_waiter, shutdown_waiter, *poll_tasks, return_exceptions=True
+        )
 
         if auth_expired_event.is_set():
             sys.exit(1)
@@ -1147,7 +1227,10 @@ async def main():
         logging.error("Configuration error: %s", exc)
         return
 
-    await run_monitor(config, WEBHOOK_TARGETS)
+    try:
+        await run_monitor(config, WEBHOOK_TARGETS)
+    except MonitorConfigError as exc:
+        logging.error("Configuration error: %s", exc)
 
 
 async def login(domain="amazon.com"):
