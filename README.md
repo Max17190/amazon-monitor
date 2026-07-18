@@ -294,6 +294,12 @@ The bounded `us-east4-eqdc4a` canary selected a 5-second cadence. Its final
 223.7 ms p95. The internal response-read-through-dispatch benchmark measured
 0.054 ms p95 on the same Railway run.
 
+A subsequent [20-ASIN transport bakeoff](docs/tvss-transport-benchmark.md)
+compared aiohttp with curl_cffi HTTP/1.1, HTTP/2, and pinned Chrome-profile
+HTTP/2. No curl candidate passed the latency and confidence gates, so aiohttp
+remains the production transport and no curl dependency or transport setting
+was added.
+
 | Mode | p50 | p95 | n |
 | --- | --- | --- | --- |
 | **Fast-alert** (batch to webhook) | **109 ms** | **234 ms** | 15 successful attempts |
