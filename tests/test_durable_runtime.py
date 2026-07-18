@@ -1,5 +1,7 @@
 import json
+import inspect
 import os
+import time
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -8,11 +10,13 @@ from uuid import uuid4
 
 from amazon_tvss import BatchObservation, ObservationStatus
 from durable_runtime import (
+    ConfirmationThrottle,
     DurableStockCoordinator,
     PostgresOutboxRepository,
     _batch_evidence,
     _batch_product_payload,
     _build_group_maps,
+    _leader_supervisor,
     validate_durable_configuration,
 )
 from durable_store import ScopeKey
@@ -26,9 +30,19 @@ class FakeStockStore:
         self.rows = {}
         self.transitions = []
         self.verifications = []
+        self.bulk_loads = 0
+        self.committed_scopes = []
 
     async def load_product_state(self, scope):
         return self.rows.get(scope)
+
+    async def load_product_states(self, scopes):
+        self.bulk_loads += 1
+        return {
+            scope: self.rows[scope]
+            for scope in scopes
+            if scope in self.rows
+        }
 
     async def commit_stock_decision(
         self,
@@ -64,6 +78,48 @@ class FakeStockStore:
         self.verifications.append((scope, source_sequence, evidence))
         return uuid4()
 
+    async def commit_stock_decisions(
+        self,
+        decisions,
+        **_lease,
+    ):
+        from durable_store import BatchCommitResult
+
+        decisions = tuple(decisions)
+        self.committed_scopes = [item.scope for item in decisions]
+        next_rows = dict(self.rows)
+        transitions = []
+        verifications = []
+        versions = {}
+        transition_ids = []
+        delivery_ids = []
+        for item in decisions:
+            current = next_rows.get(item.scope)
+            current_version = current.get("version") if current else None
+            if current_version != item.expected_version:
+                from durable_store import StateConflict
+                raise StateConflict("fake optimistic conflict")
+            row = dict(item.state_record)
+            row["version"] = 1 if current_version is None else current_version + 1
+            row["last_evidence"] = item.evidence
+            next_rows[item.scope] = row
+            versions[item.scope] = row["version"]
+            if item.transition is not None:
+                transitions.append((item.transition, item.alert, item.targets))
+                transition_ids.append(item.transition.transition_id)
+                delivery_ids.extend(target.delivery_id for target in item.targets)
+            if item.verification is not None:
+                verifications.append((item.scope, item.verification.source_sequence, item.verification.evidence))
+        self.rows = next_rows
+        self.transitions.extend(transitions)
+        self.verifications.extend(verifications)
+        return BatchCommitResult(
+            versions,
+            tuple(transition_ids),
+            tuple(delivery_ids),
+            tuple(uuid4() for _ in verifications),
+        )
+
 
 class FakeOutboxStore:
     def __init__(self, rows):
@@ -92,17 +148,32 @@ class DurableConfigurationTests(unittest.TestCase):
                 env={"DATABASE_URL": "postgresql://db"},
             )
 
-    def test_rejects_sub_five_second_production_interval(self):
+    def test_accepts_requested_sub_five_interval_for_calibrated_fallback(self):
         env = {
             "DATABASE_URL": "postgresql://db",
             "MONITOR_ID": "test",
         }
-        with self.assertRaisesRegex(Exception, "at least 5"):
-            validate_durable_configuration(self.config(4.99), env=env)
-        env["TVSS_CALIBRATION_MODE"] = "true"
         self.assertEqual(
             validate_durable_configuration(self.config(0.5), env=env),
             "test",
+        )
+        with self.assertRaisesRegex(Exception, "positive"):
+            validate_durable_configuration(self.config(0), env=env)
+
+    def test_fast_alert_confirmation_uses_one_slot_per_twelve_polls(self):
+        throttle = ConfirmationThrottle(12)
+        for _ in range(11):
+            throttle.note_poll()
+            self.assertFalse(throttle.due(fast_alert=True))
+        throttle.note_poll()
+        self.assertTrue(throttle.due(fast_alert=True))
+        throttle.consumed()
+        self.assertFalse(throttle.due(fast_alert=True))
+        self.assertTrue(throttle.due(fast_alert=False))
+
+    def test_leader_supervisor_accepts_calibration_authority_arguments(self):
+        inspect.signature(_leader_supervisor).bind(
+            *([None] * 15)
         )
 
     def test_rejects_unsafe_lease_and_rearm_configuration(self):
@@ -254,6 +325,39 @@ class DurableStockIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(self.store.transitions), 1)
 
+    async def test_batch_uses_one_bulk_load_and_commits_fanout_once(self):
+        second = "B000000002"
+        self.coordinator.asin_groups[second] = ["GPUs"]
+        self.coordinator.asin_targets[second] = [self.target_a]
+        product = {
+            "asin": self.asin, "title": "Product", "images": [], "source": "tvss"
+        }
+        second_product = {**product, "asin": second}
+        observations = []
+        # Submit the non-buyable item first to prove the fast path reorders
+        # independent batch decisions before its durable commit.
+        for asin, item, offer in (
+            (second, second_product, None),
+            (self.asin, product, "offer"),
+        ):
+            observations.append((
+                StockEvidence(
+                    scope_key=self.coordinator.scope_name(asin), sequence=1,
+                    observed_at=self.started, source=EvidenceSource.BATCH,
+                    response_complete=True, offer_id=offer,
+                    offer_explicitly_null=offer is None,
+                    availability_condition=("IN_STOCK" if offer else "OUT_OF_STOCK"),
+                ),
+                item,
+            ))
+        decisions, result = await self.coordinator.process_batch(observations)
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(self.store.bulk_loads, 1)
+        self.assertEqual(self.store.committed_scopes[0], self.coordinator.scope(self.asin))
+        self.assertEqual(len(result.versions), 2)
+        self.assertEqual(len(self.store.rows), 2)
+        self.assertEqual(len(self.store.verifications), 1)
+
 
 class EvidenceAdapterTests(unittest.TestCase):
     def test_batch_offer_is_complete_without_availability_text(self):
@@ -310,6 +414,22 @@ class OutboxAdapterTests(unittest.IsolatedAsyncioTestCase):
             "https://secret.example/webhook",
         )
         self.assertNotIn("url", row)
+
+    async def test_forwards_preferred_delivery_ids_to_store(self):
+        class RecordingStore(FakeOutboxStore):
+            async def claim_deliveries(self, *args, **kwargs):
+                self.preferred = kwargs["preferred_delivery_ids"]
+                return []
+
+        store = RecordingStore([])
+        repository = PostgresOutboxRepository(store, {}, "worker")
+        await repository.claim_due(
+            limit=1,
+            now=time.time(),
+            lease_seconds=30,
+            preferred_delivery_ids=("preferred",),
+        )
+        self.assertEqual(store.preferred, ("preferred",))
 
 
 if __name__ == "__main__":

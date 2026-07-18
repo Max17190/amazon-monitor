@@ -3,6 +3,10 @@ import unittest
 
 from credential_governor import (
     BASE_429_COOLDOWN_SECONDS,
+    CALIBRATION_REQUIRED_OBSERVATIONS,
+    CALIBRATION_VALIDITY_SECONDS,
+    CalibrationKey,
+    InMemoryCadenceCalibrationStore,
     DEFAULT_INTERVAL_SECONDS,
     CredentialLeaseFenceLost,
     HalfOpenPollRequired,
@@ -10,6 +14,7 @@ from credential_governor import (
     PostgresCredentialGovernor,
     RECOVERY_SUCCESS_COUNT,
     RequestClass,
+    production_interval_for_calibration,
     stable_credential_key,
 )
 
@@ -55,6 +60,8 @@ class FakeAsyncpgConnection:
                 "interval_seconds": interval, "next_request_at": 0.0, "blocked_until": 0.0,
                 "generation": 0, "consecutive_429": 0, "success_streak": 0,
                 "half_open_pending": False, "lease_owner": None, "lease_expires_at": 0.0,
+                "recovery_floor_seconds": interval,
+                "last_rate_limited_at": 0.0,
             }
         elif sql.startswith("UPDATE credential_governor"):
             key = args[0]
@@ -62,6 +69,8 @@ class FakeAsyncpgConnection:
                 "interval_seconds": args[1], "next_request_at": args[2], "blocked_until": args[3],
                 "generation": args[4], "consecutive_429": args[5], "success_streak": args[6],
                 "half_open_pending": args[7], "lease_owner": args[8], "lease_expires_at": args[9],
+                "recovery_floor_seconds": args[10],
+                "last_rate_limited_at": args[11],
             }
 
 
@@ -87,6 +96,8 @@ class ConcurrentCreatorConnection(FakeAsyncpgConnection):
                 "interval_seconds": 17.0, "next_request_at": 0.0, "blocked_until": 0.0,
                 "generation": 0, "consecutive_429": 0, "success_streak": 0,
                 "half_open_pending": False, "lease_owner": None, "lease_expires_at": 0.0,
+                "recovery_floor_seconds": 17.0,
+                "last_rate_limited_at": 0.0,
             }
             if "ON CONFLICT (credential_key) DO NOTHING" not in sql:
                 raise RuntimeError("duplicate key value violates unique constraint")
@@ -239,6 +250,24 @@ class CredentialGovernorTests(unittest.TestCase):
             self.clock.now = confirm.scheduled_at + 10
         self.assertEqual(self.await_(self.governor.snapshot(self.key)).interval_seconds, 10.0)
 
+    def test_calibration_invalidation_raises_recovery_floor(self):
+        calibrated = InMemoryCredentialGovernor(
+            clock=self.clock,
+            base_interval=0.5,
+        )
+        raised = self.await_(
+            calibrated.raise_interval_floor(self.key, 5.0)
+        )
+        self.assertEqual(raised.interval_seconds, 5.0)
+        permit = self.await_(
+            calibrated.acquire_permit(self.key, RequestClass.POLL)
+        )
+        self.await_(calibrated.record_result(permit, 200))
+        self.assertEqual(
+            self.await_(calibrated.snapshot(self.key)).interval_seconds,
+            5.0,
+        )
+
     def test_postgres_governor_persists_state_through_asyncpg_style_pool(self):
         pool = FakeAsyncpgPool()
         postgres = PostgresCredentialGovernor(pool, clock=self.clock)
@@ -251,6 +280,33 @@ class CredentialGovernorTests(unittest.TestCase):
         next_permit = self.await_(restarted.acquire_permit(self.key, RequestClass.POLL))
         self.assertEqual(next_permit.scheduled_at, limited.blocked_until)
         self.assertTrue(next_permit.half_open_probe)
+
+    def test_restarted_replica_cannot_recover_below_persisted_floor(self):
+        pool = FakeAsyncpgPool()
+        first = PostgresCredentialGovernor(
+            pool, clock=self.clock, base_interval=0.5
+        )
+        self.await_(first.initialize())
+        permit = self.await_(
+            first.acquire_permit(self.key, RequestClass.POLL)
+        )
+        self.await_(first.record_result(permit, 429))
+        row = pool.connection.rows[self.key]
+        row["blocked_until"] = 0
+        row["next_request_at"] = 0
+        row["half_open_pending"] = False
+        row["interval_seconds"] = 5.25
+        row["success_streak"] = RECOVERY_SUCCESS_COUNT - 1
+
+        restarted = PostgresCredentialGovernor(
+            pool, clock=self.clock, base_interval=0.5
+        )
+        recovery = self.await_(
+            restarted.acquire_permit(self.key, RequestClass.POLL)
+        )
+        snapshot = self.await_(restarted.record_result(recovery, 200))
+        self.assertEqual(snapshot.interval_seconds, 5.0)
+        self.assertEqual(snapshot.recovery_floor_seconds, 5.0)
 
     def test_postgres_governor_initialization_is_safe_when_another_replica_wins_insert(self):
         pool = ConcurrentCreatorPool()
@@ -266,6 +322,98 @@ class CredentialGovernorTests(unittest.TestCase):
                 "ON CONFLICT (credential_key) DO NOTHING" in sql
                 for sql in pool.connection.executed
             )
+        )
+
+
+class CadenceCalibrationTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = FakeClock()
+        self.store = InMemoryCadenceCalibrationStore(clock=self.clock)
+        self.key = CalibrationKey(
+            credential_key="tvss-safe-hash",
+            marketplace_id="ATVPDKIKX0DER",
+            region="us-west-2",
+            direct_route=True,
+            batch_size=20,
+        )
+
+    def await_(self, coroutine):
+        return asyncio.run(coroutine)
+
+    def test_missing_calibration_falls_back_to_production_floor(self):
+        self.assertEqual(
+            production_interval_for_calibration(0.5, None, now=self.clock.now),
+            5.0,
+        )
+
+    def test_clean_direct_calibration_allows_requested_sub_five_interval(self):
+        snapshot = self.await_(self.store.record_validation(
+            self.key, 0.5, CALIBRATION_REQUIRED_OBSERVATIONS
+        ))
+        self.assertEqual(
+            production_interval_for_calibration(0.5, snapshot, now=self.clock.now),
+            0.5,
+        )
+
+    def test_expired_or_mismatched_calibration_falls_back_to_floor(self):
+        snapshot = self.await_(self.store.record_validation(
+            self.key, 0.5, CALIBRATION_REQUIRED_OBSERVATIONS
+        ))
+        self.assertEqual(
+            production_interval_for_calibration(
+                0.5, snapshot, now=self.clock.now + CALIBRATION_VALIDITY_SECONDS + 1
+            ),
+            5.0,
+        )
+        different_route = CalibrationKey(
+            credential_key=self.key.credential_key,
+            marketplace_id=self.key.marketplace_id,
+            region="us-east-1",
+            direct_route=True,
+            batch_size=20,
+        )
+        self.assertIsNone(self.await_(self.store.load(different_route)))
+
+    def test_429_invalidation_disables_every_calibration_for_credential(self):
+        self.await_(self.store.record_validation(
+            self.key, 0.5, CALIBRATION_REQUIRED_OBSERVATIONS
+        ))
+        self.await_(self.store.invalidate_credential(
+            self.key.credential_key, self.key.marketplace_id
+        ))
+        invalidated = self.await_(self.store.load(self.key))
+        self.assertEqual(
+            production_interval_for_calibration(0.5, invalidated, now=self.clock.now),
+            5.0,
+        )
+
+    def test_network_errors_and_insufficient_observations_never_validate(self):
+        insufficient = self.await_(self.store.record_validation(
+            self.key, 0.5, CALIBRATION_REQUIRED_OBSERVATIONS - 1
+        ))
+        self.assertEqual(
+            production_interval_for_calibration(0.5, insufficient, now=self.clock.now),
+            5.0,
+        )
+        errored = self.await_(self.store.record_validation(
+            self.key, 0.5, CALIBRATION_REQUIRED_OBSERVATIONS, network_error_count=1
+        ))
+        self.assertEqual(
+            production_interval_for_calibration(0.5, errored, now=self.clock.now),
+            5.0,
+        )
+
+    def test_calibration_cannot_authorize_a_faster_unvalidated_interval(self):
+        snapshot = self.await_(self.store.record_validation(
+            self.key, 1.0, CALIBRATION_REQUIRED_OBSERVATIONS
+        ))
+        self.assertEqual(
+            production_interval_for_calibration(0.5, snapshot, now=self.clock.now),
+            5.0,
+        )
+        self.assertEqual(
+            production_interval_for_calibration(2.0, snapshot, now=self.clock.now),
+            2.0,
         )
 
 

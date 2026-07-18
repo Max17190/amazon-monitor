@@ -1,20 +1,27 @@
 import asyncio
+import json
 import os
 import unittest
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
 
 from credential_governor import (
+    CalibrationKey,
     CredentialLeaseFenceLost,
+    PostgresCadenceCalibrationStore,
     PostgresCredentialGovernor,
     RequestClass,
 )
 from durable_store import (
     AlertWrite,
+    BatchStockDecision,
     PostgresStore,
     ScopeKey,
     TargetWrite,
     TransitionWrite,
+    VerificationWrite,
+    DELIVERY_CLAIM_LOCK_ID,
 )
 
 
@@ -45,6 +52,7 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     stock_verification_jobs,
                     stock_transitions,
                     product_states,
+                    credential_cadence_calibrations,
                     credential_governor
                 RESTART IDENTITY CASCADE
                 """
@@ -115,7 +123,7 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ) IS NOT NULL
                 """
             )
-        self.assertEqual(versions, 1)
+        self.assertEqual(versions, 2)
         self.assertTrue(circuits)
 
     async def test_transition_and_delivery_intents_commit_atomically(self):
@@ -154,6 +162,138 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "alerts": 1,
             "deliveries": 2,
         })
+
+    async def test_batch_commit_returns_ids_and_rolls_back_every_scope(self):
+        first = ScopeKey("monitor", "market", "B000000001", "policy")
+        second = ScopeKey("monitor", "market", "B000000002", "policy")
+        transition, alert, targets = self.writes()
+        second_transition, second_alert, second_targets = self.writes(
+            targets=("invalid",), target_kind="unsupported"
+        )
+        with self.assertRaises(Exception):
+            await self.store.commit_stock_decisions((
+                BatchStockDecision(
+                    first, self.state(), None, {"offer_id": "offer"},
+                    transition, alert, targets,
+                    VerificationWrite(1, {"offer_id": "offer"}),
+                ),
+                BatchStockDecision(
+                    second,
+                    {**self.state(), "scope_key": "monitor:market:B000000002:policy"},
+                    None, {"offer_id": "offer"}, second_transition,
+                    second_alert, second_targets,
+                ),
+            ))
+        async with self.store.pool.acquire() as connection:
+            self.assertEqual(
+                await connection.fetchval(
+                    "SELECT COUNT(*) FROM product_states"
+                ),
+                0,
+            )
+
+        second_transition, second_alert, second_targets = self.writes(
+            targets=("three",)
+        )
+        result = await self.store.commit_stock_decisions((
+            BatchStockDecision(
+                first, self.state(), None, {"offer_id": "offer"},
+                transition, alert, targets,
+                VerificationWrite(1, {"offer_id": "offer"}),
+            ),
+            BatchStockDecision(
+                second,
+                {**self.state(), "scope_key": "monitor:market:B000000002:policy"},
+                None, {"offer_id": "offer"}, second_transition,
+                second_alert, second_targets,
+            ),
+        ))
+        self.assertEqual(set(result.transition_ids), {
+            transition.transition_id, second_transition.transition_id,
+        })
+        self.assertEqual(set(result.delivery_ids), {
+            *(target.delivery_id for target in targets),
+            *(target.delivery_id for target in second_targets),
+        })
+        self.assertEqual(len(result.verification_job_ids), 1)
+
+    async def test_batch_commit_notifies_only_after_delivery_commit(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes()
+        received = []
+        notified = asyncio.Event()
+        async with self.store.pool.acquire() as listener:
+            def on_notification(_connection, _pid, _channel, payload):
+                received.append(json.loads(payload))
+                notified.set()
+
+            await listener.add_listener("alert_outbox_ready", on_notification)
+            try:
+                result = await self.store.commit_stock_decisions((
+                    BatchStockDecision(
+                        scope, self.state(), None, {"offer_id": "offer"},
+                        transition, alert, targets,
+                    ),
+                ))
+                await asyncio.wait_for(notified.wait(), timeout=1.0)
+            finally:
+                await listener.remove_listener("alert_outbox_ready", on_notification)
+        self.assertEqual(received, [{"delivery_ids": []}])
+        async with self.store.pool.acquire() as connection:
+            self.assertEqual(
+                await connection.fetchval("SELECT COUNT(*) FROM alert_deliveries"),
+                len(result.delivery_ids),
+            )
+
+    async def test_batch_commit_uses_bounded_set_based_statements(self):
+        scope_one = ScopeKey("monitor", "market", "B000000001", "policy")
+        scope_two = ScopeKey("monitor", "market", "B000000002", "policy")
+        first_transition, first_alert, first_targets = self.writes()
+        second_transition, second_alert, second_targets = self.writes(
+            targets=("three", "four")
+        )
+        async with self.store.pool.acquire() as connection:
+            if not hasattr(connection, "add_query_logger"):
+                self.skipTest("asyncpg query logger unavailable")
+
+            class SingleConnectionPool:
+                @asynccontextmanager
+                async def acquire(self):
+                    yield connection
+
+            original_pool = self.store.pool
+            self.store.pool = SingleConnectionPool()
+            queries = []
+            query_logger = lambda record: queries.append(record.query)
+            connection.add_query_logger(query_logger)
+            try:
+                result = await self.store.commit_stock_decisions((
+                    BatchStockDecision(
+                        scope_one, self.state(), None, {"offer_id": "one"},
+                        first_transition, first_alert, first_targets,
+                        VerificationWrite(1, {"offer_id": "one"}),
+                    ),
+                    BatchStockDecision(
+                        scope_two,
+                        {**self.state(), "scope_key": "monitor:market:B000000002:policy"},
+                        None, {"offer_id": "two"}, second_transition,
+                        second_alert, second_targets,
+                    ),
+                ))
+                await asyncio.sleep(0)
+            finally:
+                connection.remove_query_logger(query_logger)
+                self.store.pool = original_pool
+        self.assertEqual(len(result.transition_ids), 2)
+        bulk_queries = [
+            query for query in queries
+            if any(table in query for table in (
+                "product_states", "stock_transitions", "alert_events",
+                "stock_verification_jobs",
+            ))
+        ]
+        self.assertEqual(len(bulk_queries), 1)
+        self.assertTrue(all("jsonb_to_recordset" in query for query in bulk_queries))
 
     async def test_invalid_delivery_rolls_back_state_and_transition(self):
         scope = ScopeKey(
@@ -206,6 +346,77 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await restarted.snapshot(key)
         self.assertEqual(snapshot.blocked_until, limited.blocked_until)
         self.assertTrue(snapshot.half_open_pending)
+
+    async def test_calibration_survives_restart_and_429_invalidation(self):
+        key = CalibrationKey(
+            "tvss-calibrated",
+            "market",
+            "region-a",
+            True,
+            20,
+        )
+        calibrations = PostgresCadenceCalibrationStore(self.store.pool)
+        await calibrations.record_validation(key, 0.5, 120)
+        restarted = PostgresCadenceCalibrationStore(self.store.pool)
+        loaded = await restarted.load(key)
+        self.assertEqual(loaded.interval_seconds, 0.5)
+        self.assertIsNone(loaded.invalidated_at)
+        self.assertEqual(
+            await restarted.invalidate_credential(
+                key.credential_key, key.marketplace_id
+            ),
+            1,
+        )
+        self.assertIsNotNone((await restarted.load(key)).invalidated_at)
+
+    async def test_leader_activation_rechecks_expiry_and_last_429(self):
+        key = CalibrationKey(
+            "tvss-activation",
+            "market",
+            "region-a",
+            True,
+            20,
+        )
+        governor = PostgresCredentialGovernor(
+            self.store.pool, base_interval=5
+        )
+        self.assertTrue(
+            await governor.acquire_leader(
+                key.credential_key, "replica", 30
+            )
+        )
+        calibrations = PostgresCadenceCalibrationStore(self.store.pool)
+        await calibrations.record_validation(key, 0.5, 120)
+        effective, _ = await calibrations.activate_for_leader(
+            key, 0.5, "replica"
+        )
+        self.assertEqual(effective, 0.5)
+
+        permit = await governor.acquire_permit(
+            key.credential_key,
+            RequestClass.POLL,
+            owner_id="replica",
+        )
+        await governor.record_result(
+            permit, 429, owner_id="replica"
+        )
+        effective, _ = await calibrations.activate_for_leader(
+            key, 0.5, "replica"
+        )
+        self.assertEqual(effective, 5.0)
+
+        await calibrations.record_validation(key, 0.5, 120)
+        effective, _ = await calibrations.activate_for_leader(
+            key, 0.5, "replica"
+        )
+        self.assertEqual(effective, 0.5)
+        effective, _ = await calibrations.activate_for_leader(
+            key,
+            0.5,
+            "replica",
+            validity_seconds=0,
+        )
+        self.assertEqual(effective, 5.0)
 
     async def test_stale_credential_leader_cannot_commit_stock_or_outbox(self):
         governor = PostgresCredentialGovernor(self.store.pool, base_interval=5)
@@ -354,6 +565,121 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(first), 2)
         self.assertEqual(len(second), 0)
+
+    async def test_saturated_target_does_not_hide_another_due_target(self):
+        for index in range(10):
+            asin = f"SAME{index:06d}"
+            transition, alert, targets = self.writes(targets=("same",))
+            state = self.state(sequence=index + 1)
+            state["scope_key"] = f"monitor:market:{asin}:policy"
+            await self.store.commit_stock_decision(
+                ScopeKey("monitor", "market", asin, "policy"),
+                state,
+                None,
+                transition=transition,
+                alert=alert,
+                targets=targets,
+                evidence={"offer_id": "offer"},
+            )
+        other_asin = "OTHER00001"
+        transition, alert, targets = self.writes(targets=("other",))
+        state = self.state(sequence=11)
+        state["scope_key"] = (
+            f"monitor:market:{other_asin}:policy"
+        )
+        await self.store.commit_stock_decision(
+            ScopeKey("monitor", "market", other_asin, "policy"),
+            state,
+            None,
+            transition=transition,
+            alert=alert,
+            targets=targets,
+            evidence={"offer_id": "offer"},
+        )
+        first = await self.store.claim_deliveries(
+            "replica-a",
+            limit=1,
+            lease_seconds=30,
+            per_target_limit=1,
+        )
+        second = await self.store.claim_deliveries(
+            "replica-b",
+            limit=1,
+            lease_seconds=30,
+            per_target_limit=1,
+        )
+        self.assertEqual(first[0]["target_id"], "same")
+        self.assertEqual(second[0]["target_id"], "other")
+
+    async def test_malformed_notification_id_falls_back_to_due_scan(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes(targets=("same",))
+        await self.store.commit_stock_decision(
+            scope,
+            self.state(),
+            None,
+            transition=transition,
+            alert=alert,
+            targets=targets,
+            evidence={"offer_id": "offer"},
+        )
+        claimed = await self.store.claim_deliveries(
+            "replica",
+            limit=1,
+            lease_seconds=30,
+            preferred_delivery_ids=("not-a-uuid",),
+        )
+        self.assertEqual(len(claimed), 1)
+
+    async def test_claim_query_has_an_executable_analyzed_plan(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes(targets=("same",))
+        await self.store.commit_stock_decision(
+            scope,
+            self.state(),
+            None,
+            transition=transition,
+            alert=alert,
+            targets=targets,
+            evidence={"offer_id": "offer"},
+        )
+        async with self.store.pool.acquire() as connection:
+            class SingleConnectionPool:
+                @asynccontextmanager
+                async def acquire(self):
+                    yield connection
+
+            queries = []
+            logger = lambda record: queries.append(record.query)
+            original_pool = self.store.pool
+            self.store.pool = SingleConnectionPool()
+            connection.add_query_logger(logger)
+            try:
+                await self.store.claim_deliveries(
+                    "replica",
+                    limit=1,
+                    lease_seconds=30,
+                )
+                await asyncio.sleep(0)
+            finally:
+                connection.remove_query_logger(logger)
+                self.store.pool = original_pool
+            claim_query = next(
+                query for query in queries if "WITH claim_lock" in query
+            )
+            plan = await connection.fetchval(
+                "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) " + claim_query,
+                DELIVERY_CLAIM_LOCK_ID,
+                1,
+                "explain",
+                30.0,
+                32,
+                2,
+                [],
+            )
+        if isinstance(plan, str):
+            plan = json.loads(plan)
+        self.assertIn("Execution Time", plan[0])
 
     async def test_persisted_target_circuit_opens_after_five_failures(self):
         scope = ScopeKey(
