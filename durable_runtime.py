@@ -33,6 +33,7 @@ from amazon_tvss import (
     TVSSRateLimitError,
 )
 from credential_governor import (
+    CredentialLeaseFenceLost,
     PostgresCredentialGovernor,
     new_owner_id,
     stable_credential_key,
@@ -552,7 +553,13 @@ class DurableStockCoordinator:
             self.policy.fingerprint,
         )
 
-    async def process(self, evidence, product_data):
+    async def process(
+        self,
+        evidence,
+        product_data,
+        lease_credential_key=None,
+        lease_owner=None,
+    ):
         scope = self.scope(product_data["asin"])
         for _ in range(4):
             stored = await self.store.load_product_state(scope)
@@ -655,14 +662,22 @@ class DurableStockCoordinator:
                             alert,
                             trace_context=_traceparent(span),
                         )
+                    commit_kwargs = {
+                        "transition": transition,
+                        "alert": alert,
+                        "targets": target_writes,
+                        "evidence": asdict(evidence),
+                    }
+                    if lease_credential_key is not None and lease_owner is not None:
+                        commit_kwargs.update(
+                            lease_credential_key=lease_credential_key,
+                            lease_owner=lease_owner,
+                        )
                     persisted = await self.store.commit_stock_decision(
                         scope,
                         decision.next_record.to_record(),
                         expected_version,
-                        transition=transition,
-                        alert=alert,
-                        targets=target_writes,
-                        evidence=asdict(evidence),
+                        **commit_kwargs,
                     )
                 self.metrics.observe(
                     "alert_detect_to_persist_seconds",
@@ -943,10 +958,18 @@ async def _poll_credential(
                 await coordinator.process(
                     evidence,
                     _batch_product_payload(client, asin, observation),
+                    lease_credential_key=client.credential_key,
+                    lease_owner=client.credential_owner_id,
                 )
             runtime_status.last_poll_success_at = time.time()
             metrics.set_gauge("tvss_poll_freshness_seconds", 0.0)
             auth_failure_started = None
+        except CredentialLeaseFenceLost:
+            # Do not accept a stale response or persist it after another
+            # replica has acquired this credential.
+            raise CredentialLeaseLost(
+                "TVSS credential lease was fenced during poll work"
+            )
         except TVSSRateLimitError as exc:
             metrics.increment("tvss_rate_limit_total")
             snapshot = await client.durable_governor.snapshot(
@@ -997,6 +1020,9 @@ async def _poll_credential(
             break
         jobs = await store.claim_verification_jobs(
             worker_id,
+            coordinator.monitor_id,
+            coordinator.marketplace_id,
+            coordinator.policy.fingerprint,
             limit=1,
             lease_seconds=float(
                 os.getenv(
@@ -1017,8 +1043,15 @@ async def _poll_credential(
                 time.time_ns(),
                 _utc_now(),
             )
-            await coordinator.process(evidence, product)
-            await store.finish_verification(job["job_id"], success=True)
+            await coordinator.process(
+                evidence,
+                product,
+                lease_credential_key=client.credential_key,
+                lease_owner=client.credential_owner_id,
+            )
+            await store.finish_verification(
+                job["job_id"], worker_id, success=True
+            )
             created_at = job.get("created_at")
             if isinstance(created_at, datetime):
                 metrics.observe(
@@ -1031,12 +1064,17 @@ async def _poll_credential(
             )
         except asyncio.CancelledError:
             raise
+        except CredentialLeaseFenceLost:
+            raise CredentialLeaseLost(
+                "TVSS credential lease was fenced during confirmation work"
+            )
         except Exception:
             logging.exception(
                 "Full-product confirmation failed for ASIN %s", job["asin"]
             )
             await store.finish_verification(
                 job["job_id"],
+                worker_id,
                 success=False,
                 retryable=True,
             )
@@ -1211,7 +1249,7 @@ async def run_durable_monitor(config, webhook_targets):
             ),
         )
         await governor.initialize()
-        client.configure_durable_governor(governor, credential_key)
+        client.configure_durable_governor(governor, credential_key, owner_id)
 
         all_asins = list(
             dict.fromkeys(
@@ -1454,7 +1492,7 @@ async def exclusive_canary_lease(
         raise TVSSConfigError(
             "production or another canary currently owns this TVSS credential"
         )
-    client.configure_durable_governor(governor, key)
+    client.configure_durable_governor(governor, key, owner_id)
     try:
         yield
     finally:

@@ -15,6 +15,11 @@ from amazon_tvss import (
     TVSSClient,
     TVSSRateLimitError,
 )
+from credential_governor import (
+    CredentialLeaseFenceLost,
+    Permit,
+    RequestClass,
+)
 from tvss_runtime import (
     CredentialRateController,
     ProxyPool,
@@ -988,6 +993,46 @@ class CredentialRateControllerTests(unittest.TestCase):
 
         asyncio.run(concurrent_requests())
         self.assertEqual(session.max_active, 1)
+
+    def test_durable_client_fences_after_permit_wait_before_http_attempt(self):
+        class Governor:
+            async def acquire_permit(self, key, request_class, owner_id=None):
+                return Permit(
+                    credential_key=key,
+                    request_class=request_class,
+                    scheduled_at=0.0,
+                    wait_seconds=0.0,
+                    generation=0,
+                    half_open_probe=False,
+                    lease_owner=owner_id,
+                )
+
+            async def ensure_leader(self, _key, _owner_id):
+                raise CredentialLeaseFenceLost("lease handed off")
+
+        class FakeSession:
+            def __init__(self):
+                self.requests = 0
+
+            def request(self, *_args, **_kwargs):
+                self.requests += 1
+                raise AssertionError("fenced request must not reach the network")
+
+        with patch.dict(
+            os.environ,
+            {
+                "TVSS_COOKIE_HEADER": "session-id=1",
+                "PROXY_MODE": "direct",
+            },
+            clear=False,
+        ):
+            client = TVSSClient()
+        client.configure_durable_governor(Governor(), "credential", "old")
+        session = FakeSession()
+
+        with self.assertRaises(CredentialLeaseFenceLost):
+            asyncio.run(client._request(session, "GET", "https://tvss.amazon.com/test"))
+        self.assertEqual(session.requests, 0)
 
 
 class ProxyPoolTests(unittest.TestCase):

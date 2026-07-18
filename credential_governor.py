@@ -26,6 +26,10 @@ class HalfOpenPollRequired(RuntimeError):
     """A cooldown may be exited only by one batch poll."""
 
 
+class CredentialLeaseFenceLost(RuntimeError):
+    """The caller no longer owns the credential lease needed for work."""
+
+
 @dataclass(frozen=True)
 class Permit:
     credential_key: str
@@ -34,6 +38,7 @@ class Permit:
     wait_seconds: float
     generation: int
     half_open_probe: bool
+    lease_owner: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -52,9 +57,19 @@ class CredentialGovernor(Protocol):
     async def acquire_leader(self, credential_key: str, owner_id: str, ttl_seconds: float) -> bool: ...
     async def renew_leader(self, credential_key: str, owner_id: str, ttl_seconds: float) -> bool: ...
     async def release_leader(self, credential_key: str, owner_id: str) -> bool: ...
-    async def acquire_permit(self, credential_key: str, request_class: RequestClass) -> Permit: ...
+    async def ensure_leader(self, credential_key: str, owner_id: str) -> None: ...
+    async def acquire_permit(
+        self,
+        credential_key: str,
+        request_class: RequestClass,
+        owner_id: Optional[str] = None,
+    ) -> Permit: ...
     async def record_result(
-        self, permit: Permit, status: Optional[int], retry_after_seconds: Optional[float] = None
+        self,
+        permit: Permit,
+        status: Optional[int],
+        retry_after_seconds: Optional[float] = None,
+        owner_id: Optional[str] = None,
     ) -> GovernorSnapshot: ...
 
 
@@ -107,7 +122,13 @@ def _snapshot(key: str, state: _State) -> GovernorSnapshot:
     )
 
 
-def _reserve(key: str, state: _State, request_class: RequestClass, now: float) -> Permit:
+def _reserve(
+    key: str,
+    state: _State,
+    request_class: RequestClass,
+    now: float,
+    owner_id: Optional[str] = None,
+) -> Permit:
     scheduled_at = max(now, state.next_request_at, state.blocked_until)
     if state.half_open_pending and request_class is not RequestClass.POLL:
         raise HalfOpenPollRequired(
@@ -124,6 +145,7 @@ def _reserve(key: str, state: _State, request_class: RequestClass, now: float) -
         wait_seconds=max(0.0, scheduled_at - now),
         generation=state.generation,
         half_open_probe=half_open,
+        lease_owner=owner_id,
     )
 
 
@@ -233,15 +255,46 @@ class InMemoryCredentialGovernor:
             state.lease_owner, state.lease_expires_at = None, 0.0
             return True
 
-    async def acquire_permit(self, credential_key: str, request_class: RequestClass) -> Permit:
-        async with self._lock:
-            return _reserve(credential_key, self._state(credential_key), request_class, self._clock())
+    @staticmethod
+    def _require_leader(state: _State, owner_id: str, now: float) -> None:
+        if state.lease_owner != owner_id or state.lease_expires_at <= now:
+            raise CredentialLeaseFenceLost(
+                "TVSS credential leader lease is no longer held"
+            )
 
-    async def record_result(self, permit: Permit, status: Optional[int], retry_after_seconds: Optional[float] = None) -> GovernorSnapshot:
+    async def ensure_leader(self, credential_key: str, owner_id: str) -> None:
         async with self._lock:
+            self._require_leader(
+                self._state(credential_key), owner_id, self._clock()
+            )
+
+    async def acquire_permit(
+        self,
+        credential_key: str,
+        request_class: RequestClass,
+        owner_id: Optional[str] = None,
+    ) -> Permit:
+        async with self._lock:
+            state, now = self._state(credential_key), self._clock()
+            if owner_id is not None:
+                self._require_leader(state, owner_id, now)
+            return _reserve(credential_key, state, request_class, now, owner_id)
+
+    async def record_result(
+        self,
+        permit: Permit,
+        status: Optional[int],
+        retry_after_seconds: Optional[float] = None,
+        owner_id: Optional[str] = None,
+    ) -> GovernorSnapshot:
+        async with self._lock:
+            state = self._state(permit.credential_key)
+            fence_owner = owner_id or permit.lease_owner
+            if fence_owner is not None:
+                self._require_leader(state, fence_owner, self._clock())
             return _record(
                 permit.credential_key,
-                self._state(permit.credential_key),
+                state,
                 permit,
                 status,
                 retry_after_seconds,
@@ -315,8 +368,11 @@ class PostgresCredentialGovernor:
                     "SELECT * FROM credential_governor WHERE credential_key = $1 FOR UPDATE", credential_key
                 )
                 if row is None:
+                    # A missing row has no row lock to serialize competing
+                    # replicas.  Let the unique key elect the creator, then
+                    # lock whichever row won before reading or mutating it.
                     await connection.execute(
-                        "INSERT INTO credential_governor (credential_key, interval_seconds, next_request_at, blocked_until, generation, consecutive_429, success_streak, half_open_pending, lease_expires_at) VALUES ($1, $2, 0, 0, 0, 0, 0, FALSE, 0)",
+                        "INSERT INTO credential_governor (credential_key, interval_seconds, next_request_at, blocked_until, generation, consecutive_429, success_streak, half_open_pending, lease_expires_at) VALUES ($1, $2, 0, 0, 0, 0, 0, FALSE, 0) ON CONFLICT (credential_key) DO NOTHING",
                         credential_key, self._base_interval,
                     )
                     row = await connection.fetchrow(
@@ -360,12 +416,40 @@ class PostgresCredentialGovernor:
             state.lease_owner, state.lease_expires_at = None, 0.0
             return True
 
-    async def acquire_permit(self, credential_key: str, request_class: RequestClass) -> Permit:
-        async with self._locked_state(credential_key) as (_, state):
-            return _reserve(credential_key, state, request_class, self._clock())
+    @staticmethod
+    def _require_leader(state: _State, owner_id: str, now: float) -> None:
+        if state.lease_owner != owner_id or state.lease_expires_at <= now:
+            raise CredentialLeaseFenceLost(
+                "TVSS credential leader lease is no longer held"
+            )
 
-    async def record_result(self, permit: Permit, status: Optional[int], retry_after_seconds: Optional[float] = None) -> GovernorSnapshot:
+    async def ensure_leader(self, credential_key: str, owner_id: str) -> None:
+        async with self._locked_state(credential_key) as (_, state):
+            self._require_leader(state, owner_id, self._clock())
+
+    async def acquire_permit(
+        self,
+        credential_key: str,
+        request_class: RequestClass,
+        owner_id: Optional[str] = None,
+    ) -> Permit:
+        async with self._locked_state(credential_key) as (_, state):
+            now = self._clock()
+            if owner_id is not None:
+                self._require_leader(state, owner_id, now)
+            return _reserve(credential_key, state, request_class, now, owner_id)
+
+    async def record_result(
+        self,
+        permit: Permit,
+        status: Optional[int],
+        retry_after_seconds: Optional[float] = None,
+        owner_id: Optional[str] = None,
+    ) -> GovernorSnapshot:
         async with self._locked_state(permit.credential_key) as (_, state):
+            fence_owner = owner_id or permit.lease_owner
+            if fence_owner is not None:
+                self._require_leader(state, fence_owner, self._clock())
             return _record(
                 permit.credential_key,
                 state,

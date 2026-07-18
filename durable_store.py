@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 from uuid import UUID, uuid4
 
+from credential_governor import CredentialLeaseFenceLost
+
 
 try:
     import asyncpg
@@ -232,6 +234,8 @@ class PostgresStore:
         alert=None,
         targets=(),
         evidence=None,
+        lease_credential_key=None,
+        lease_owner=None,
     ):
         """Atomically persist state plus an optional transition and deliveries.
 
@@ -242,6 +246,31 @@ class PostgresStore:
         targets = tuple(targets)
         async with self.pool.acquire() as connection:
             async with connection.transaction():
+                if lease_credential_key is not None or lease_owner is not None:
+                    if not lease_credential_key or not lease_owner:
+                        raise ValueError(
+                            "lease_credential_key and lease_owner are required together"
+                        )
+                    # Lock the credential row through this state transaction.
+                    # A successor cannot acquire it between this check and the
+                    # durable state/outbox commit, while an expired leader is
+                    # rejected before it can mutate monitor state.
+                    lease = await connection.fetchrow(
+                        """
+                        SELECT credential_key
+                        FROM credential_governor
+                        WHERE credential_key = $1
+                          AND lease_owner = $2
+                          AND lease_expires_at > EXTRACT(EPOCH FROM clock_timestamp())
+                        FOR UPDATE
+                        """,
+                        lease_credential_key,
+                        lease_owner,
+                    )
+                    if lease is None:
+                        raise CredentialLeaseFenceLost(
+                            "TVSS credential leader lease is no longer held"
+                        )
                 if expected_version is None:
                     inserted = await connection.fetchrow(
                         """
@@ -516,6 +545,9 @@ class PostgresStore:
     async def claim_verification_jobs(
         self,
         worker_id,
+        monitor_id,
+        marketplace_id,
+        seller_policy_hash,
         limit=1,
         lease_seconds=30.0,
     ):
@@ -529,6 +561,9 @@ class PostgresStore:
                         status = 'pending'
                         OR (status = 'leased' AND leased_until < clock_timestamp())
                     )
+                      AND monitor_id = $2
+                      AND marketplace_id = $3
+                      AND seller_policy_hash = $4
                       AND next_attempt_at <= clock_timestamp()
                       AND expires_at > clock_timestamp()
                     ORDER BY created_at
@@ -537,9 +572,9 @@ class PostgresStore:
                 )
                 UPDATE stock_verification_jobs AS job
                 SET status = 'leased',
-                    leased_by = $2,
+                    leased_by = $5,
                     leased_until = clock_timestamp()
-                        + ($3::double precision * INTERVAL '1 second'),
+                        + ($6::double precision * INTERVAL '1 second'),
                     attempts = job.attempts + 1,
                     updated_at = clock_timestamp()
                 FROM due
@@ -547,6 +582,9 @@ class PostgresStore:
                 RETURNING job.*
                 """,
                 int(limit),
+                str(monitor_id),
+                str(marketplace_id),
+                str(seller_policy_hash),
                 str(worker_id),
                 float(lease_seconds),
             )
@@ -563,10 +601,22 @@ class PostgresStore:
             )
         return [dict(row) for row in rows]
 
-    async def finish_verification(self, job_id, success, retryable=False):
+    async def finish_verification(
+        self,
+        job_id,
+        worker_id,
+        success,
+        retryable=False,
+    ):
+        """Finish a verification only while this worker still owns its lease.
+
+        A lease can expire while an Amazon request is in flight.  The job may
+        then be reclaimed by another worker, so an old response must not alter
+        the newer owner's job state.
+        """
         status = "complete" if success else ("pending" if retryable else "failed")
         async with self.pool.acquire() as connection:
-            await connection.execute(
+            result = await connection.execute(
                 """
                 UPDATE stock_verification_jobs
                 SET status = $2,
@@ -579,10 +629,15 @@ class PostgresStore:
                     leased_until = NULL,
                     updated_at = clock_timestamp()
                 WHERE job_id = $1
+                  AND status = 'leased'
+                  AND leased_by = $3
+                  AND leased_until > clock_timestamp()
                 """,
                 job_id,
                 status,
+                str(worker_id),
             )
+        return result.endswith("1")
 
     async def claim_deliveries(
         self,

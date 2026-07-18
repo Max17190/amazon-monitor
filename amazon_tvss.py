@@ -231,11 +231,15 @@ class TVSSClient:
         )
         return self.rate_controller
 
-    def configure_durable_governor(self, governor, credential_key):
+    def configure_durable_governor(self, governor, credential_key, owner_id=None):
         if not credential_key:
             raise TVSSConfigError("credential_key is required for durable governor")
         self.durable_governor = governor
         self.credential_key = credential_key
+        # Durable callers must provide the leader identity.  It is checked
+        # immediately before each physical request so a stale replica cannot
+        # spend a permit after a lease takeover.
+        self.credential_owner_id = owner_id
         self.rate_controller = None
         return governor
 
@@ -384,9 +388,17 @@ class TVSSClient:
                 permit = await self.durable_governor.acquire_permit(
                     self.credential_key,
                     request_class,
+                    owner_id=self.credential_owner_id,
                 )
                 if permit.wait_seconds:
                     await asyncio.sleep(permit.wait_seconds)
+                # A permit can wait for a full cadence slot. Revalidate after
+                # that wait at the network boundary, not only when reserving.
+                if self.credential_owner_id is not None:
+                    await self.durable_governor.ensure_leader(
+                        self.credential_key,
+                        self.credential_owner_id,
+                    )
                 timing.cadence_wait_ms += permit.wait_seconds * 1000.0
                 timing.half_open_probe = permit.half_open_probe
             attempt_started_ns = time.perf_counter_ns()

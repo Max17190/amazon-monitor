@@ -4,7 +4,11 @@ import unittest
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from credential_governor import PostgresCredentialGovernor, RequestClass
+from credential_governor import (
+    CredentialLeaseFenceLost,
+    PostgresCredentialGovernor,
+    RequestClass,
+)
 from durable_store import (
     AlertWrite,
     PostgresStore,
@@ -202,6 +206,116 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await restarted.snapshot(key)
         self.assertEqual(snapshot.blocked_until, limited.blocked_until)
         self.assertTrue(snapshot.half_open_pending)
+
+    async def test_stale_credential_leader_cannot_commit_stock_or_outbox(self):
+        governor = PostgresCredentialGovernor(self.store.pool, base_interval=5)
+        key = "tvss-commit-fence"
+        self.assertTrue(await governor.acquire_leader(key, "replica-old", 30))
+        async with self.store.pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE credential_governor
+                SET lease_owner = 'replica-new',
+                    lease_expires_at =
+                        EXTRACT(EPOCH FROM clock_timestamp()) + 30
+                WHERE credential_key = $1
+                """,
+                key,
+            )
+
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes()
+        with self.assertRaises(CredentialLeaseFenceLost):
+            await self.store.commit_stock_decision(
+                scope,
+                self.state(),
+                None,
+                transition=transition,
+                alert=alert,
+                targets=targets,
+                evidence={"offer_id": "offer"},
+                lease_credential_key=key,
+                lease_owner="replica-old",
+            )
+
+        async with self.store.pool.acquire() as connection:
+            persisted = await connection.fetchval(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM product_states)
+                    + (SELECT COUNT(*) FROM stock_transitions)
+                    + (SELECT COUNT(*) FROM alert_events)
+                    + (SELECT COUNT(*) FROM alert_deliveries)
+                """
+            )
+        self.assertEqual(persisted, 0)
+
+    async def test_verification_claim_is_scoped_to_monitor_and_policy(self):
+        scope = ScopeKey("monitor-a", "market", "B000000001", "policy-a")
+        job_id = await self.store.enqueue_verification(
+            scope,
+            source_sequence=1,
+            evidence={"offer_id": "offer"},
+            ttl_seconds=30,
+        )
+        self.assertIsNotNone(job_id)
+
+        wrong_monitor = await self.store.claim_verification_jobs(
+            "worker-a", "monitor-b", "market", "policy-a", limit=1
+        )
+        wrong_policy = await self.store.claim_verification_jobs(
+            "worker-a", "monitor-a", "market", "policy-b", limit=1
+        )
+        claimed = await self.store.claim_verification_jobs(
+            "worker-a", "monitor-a", "market", "policy-a", limit=1
+        )
+
+        self.assertEqual(wrong_monitor, [])
+        self.assertEqual(wrong_policy, [])
+        self.assertEqual([row["job_id"] for row in claimed], [job_id])
+
+    async def test_stale_verification_worker_cannot_finish_reclaimed_job(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        job_id = await self.store.enqueue_verification(
+            scope,
+            source_sequence=1,
+            evidence={"offer_id": "offer"},
+            ttl_seconds=30,
+        )
+        first = await self.store.claim_verification_jobs(
+            "worker-a", "monitor", "market", "policy", limit=1
+        )
+        self.assertEqual(len(first), 1)
+        async with self.store.pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE stock_verification_jobs
+                SET leased_until = clock_timestamp() - INTERVAL '1 second'
+                WHERE job_id = $1
+                """,
+                job_id,
+            )
+        second = await self.store.claim_verification_jobs(
+            "worker-b", "monitor", "market", "policy", limit=1
+        )
+        self.assertEqual(len(second), 1)
+
+        self.assertFalse(
+            await self.store.finish_verification(
+                job_id, "worker-a", success=True
+            )
+        )
+        self.assertTrue(
+            await self.store.finish_verification(
+                job_id, "worker-b", success=True
+            )
+        )
+        async with self.store.pool.acquire() as connection:
+            status = await connection.fetchval(
+                "SELECT status FROM stock_verification_jobs WHERE job_id = $1",
+                job_id,
+            )
+        self.assertEqual(status, "complete")
 
     async def test_claim_limits_are_global_and_per_target(self):
         for index in range(3):

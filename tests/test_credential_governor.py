@@ -4,6 +4,7 @@ import unittest
 from credential_governor import (
     BASE_429_COOLDOWN_SECONDS,
     DEFAULT_INTERVAL_SECONDS,
+    CredentialLeaseFenceLost,
     HalfOpenPollRequired,
     InMemoryCredentialGovernor,
     PostgresCredentialGovernor,
@@ -72,6 +73,36 @@ class FakeAsyncpgPool:
         return _AsyncContext(self.connection)
 
 
+class ConcurrentCreatorConnection(FakeAsyncpgConnection):
+    """Simulate another replica creating the row after the initial read."""
+
+    def __init__(self):
+        super().__init__()
+        self.competing_insert = True
+
+    async def execute(self, sql, *args):
+        if sql.startswith("INSERT INTO credential_governor") and self.competing_insert:
+            self.competing_insert = False
+            self.rows[args[0]] = {
+                "interval_seconds": 17.0, "next_request_at": 0.0, "blocked_until": 0.0,
+                "generation": 0, "consecutive_429": 0, "success_streak": 0,
+                "half_open_pending": False, "lease_owner": None, "lease_expires_at": 0.0,
+            }
+            if "ON CONFLICT (credential_key) DO NOTHING" not in sql:
+                raise RuntimeError("duplicate key value violates unique constraint")
+            self.executed.append(sql)
+            return
+        await super().execute(sql, *args)
+
+
+class ConcurrentCreatorPool:
+    def __init__(self):
+        self.connection = ConcurrentCreatorConnection()
+
+    def acquire(self):
+        return _AsyncContext(self.connection)
+
+
 class CredentialGovernorTests(unittest.TestCase):
     def setUp(self):
         self.clock = FakeClock()
@@ -94,6 +125,35 @@ class CredentialGovernorTests(unittest.TestCase):
         self.assertTrue(self.await_(self.governor.acquire_leader(self.key, "two", 10)))
         self.assertFalse(self.await_(self.governor.release_leader(self.key, "one")))
         self.assertTrue(self.await_(self.governor.release_leader(self.key, "two")))
+
+    def test_expired_leader_is_fenced_before_request_or_result_commit(self):
+        self.assertTrue(
+            self.await_(self.governor.acquire_leader(self.key, "old", 5))
+        )
+        permit = self.await_(
+            self.governor.acquire_permit(
+                self.key,
+                RequestClass.POLL,
+                owner_id="old",
+            )
+        )
+
+        self.clock.now += 6
+        self.assertTrue(
+            self.await_(self.governor.acquire_leader(self.key, "new", 30))
+        )
+        with self.assertRaises(CredentialLeaseFenceLost):
+            self.await_(self.governor.ensure_leader(self.key, "old"))
+        with self.assertRaises(CredentialLeaseFenceLost):
+            self.await_(
+                self.governor.acquire_permit(
+                    self.key,
+                    RequestClass.POLL,
+                    owner_id="old",
+                )
+            )
+        with self.assertRaises(CredentialLeaseFenceLost):
+            self.await_(self.governor.record_result(permit, 200))
 
     def test_permits_share_one_credential_cadence(self):
         first = self.await_(self.governor.acquire_permit(self.key, RequestClass.POLL))
@@ -191,6 +251,22 @@ class CredentialGovernorTests(unittest.TestCase):
         next_permit = self.await_(restarted.acquire_permit(self.key, RequestClass.POLL))
         self.assertEqual(next_permit.scheduled_at, limited.blocked_until)
         self.assertTrue(next_permit.half_open_probe)
+
+    def test_postgres_governor_initialization_is_safe_when_another_replica_wins_insert(self):
+        pool = ConcurrentCreatorPool()
+        governor = PostgresCredentialGovernor(pool, clock=self.clock)
+
+        self.assertTrue(self.await_(governor.acquire_leader(self.key, "replica-a", 30)))
+        self.assertEqual(
+            self.await_(governor.snapshot(self.key)).interval_seconds,
+            17.0,
+        )
+        self.assertTrue(
+            any(
+                "ON CONFLICT (credential_key) DO NOTHING" in sql
+                for sql in pool.connection.executed
+            )
+        )
 
 
 if __name__ == "__main__":
