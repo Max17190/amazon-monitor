@@ -5,9 +5,22 @@ import os
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
-from amazon_tvss import TVSSClient
+import aiohttp
+
+from amazon_tvss import (
+    BatchObservation,
+    ObservationStatus,
+    TVSSClient,
+    TVSSRateLimitError,
+)
+from tvss_runtime import (
+    CredentialRateController,
+    ProxyPool,
+    load_proxy_urls,
+    normalize_proxy_url,
+)
 
 logging.disable(logging.CRITICAL)
 
@@ -63,15 +76,19 @@ from main import (
     JITTER_FRACTION,
     MAX_BATCH_CONCURRENCY,
     MIN_POLL_INTERVAL_SECONDS,
+    MonitorConfig,
     MonitorConfigError,
     PENALTY_BOX_SLEEP,
     PENALTY_BOX_THRESHOLD,
     TVSS_BATCH_HARD_CAP,
+    _handle_transition,
     build_generic_payload,
     clamp,
     jittered,
     load_monitor_config,
+    product_from_batch,
 )
+from latency_e2e import format_path_latency
 from webhooks import WebhookTarget, load_webhook_targets
 
 
@@ -562,7 +579,7 @@ class BatchProductsParseTests(unittest.TestCase):
         self.assertFalse(result["B0DTJFSSZG"]["has_offer"])
         self.assertIsNone(result["B0DTJFSSZG"]["price"])
 
-    def test_missing_asin_filled_as_no_offer(self):
+    def test_missing_asin_has_no_offer_signal(self):
         client = self.make_client()
         self._mock_batch_response(client, {"products": []})
         result = self._run(client.batch_products(None, ["B000MISSING"]))
@@ -598,6 +615,440 @@ class BatchProductsParseTests(unittest.TestCase):
         })
         result = self._run(client.batch_products(None, ["B000000001"]))
         self.assertFalse(result["B000000001"]["has_offer"])
+
+    def test_missing_asin_is_unknown(self):
+        client = self.make_client()
+        self._mock_batch_response(client, {"products": []})
+        result = self._run(client.batch_products(None, ["B000MISSING"]))
+        self.assertEqual(
+            result["B000MISSING"].status,
+            ObservationStatus.UNKNOWN,
+        )
+
+    def test_partial_response_preserves_missing_as_unknown(self):
+        client = self.make_client()
+        self._mock_batch_response(
+            client,
+            {
+                "products": [
+                    {
+                        "basicProduct": {"asin": "B000000001"},
+                        "basicOffer": {"offerId": None, "price": None},
+                    }
+                ]
+            },
+        )
+        result = self._run(
+            client.batch_products(None, ["B000000001", "B000000002"])
+        )
+        self.assertEqual(
+            result["B000000001"].status,
+            ObservationStatus.OUT_OF_STOCK,
+        )
+        self.assertEqual(
+            result["B000000002"].status,
+            ObservationStatus.UNKNOWN,
+        )
+
+    def test_top_level_error_makes_every_observation_unknown(self):
+        client = self.make_client()
+        self._mock_batch_response(
+            client,
+            {
+                "errors": [{"code": "INTERNAL"}],
+                "products": [
+                    {
+                        "basicProduct": {"asin": "B000000001"},
+                        "basicOffer": {"offerId": "offer"},
+                    }
+                ],
+            },
+        )
+        result = self._run(client.batch_products(None, ["B000000001"]))
+        self.assertTrue(result.top_level_errors)
+        self.assertEqual(
+            result["B000000001"].status,
+            ObservationStatus.UNKNOWN,
+        )
+
+    def test_malformed_offer_is_unknown(self):
+        client = self.make_client()
+        self._mock_batch_response(
+            client,
+            {
+                "products": [
+                    {
+                        "basicProduct": {"asin": "B000000001"},
+                        "basicOffer": "malformed",
+                    }
+                ]
+            },
+        )
+        result = self._run(client.batch_products(None, ["B000000001"]))
+        self.assertEqual(
+            result["B000000001"].status,
+            ObservationStatus.UNKNOWN,
+        )
+
+    def test_missing_offer_field_is_unknown(self):
+        client = self.make_client()
+        self._mock_batch_response(
+            client,
+            {
+                "products": [
+                    {
+                        "basicProduct": {"asin": "B000000001"},
+                    }
+                ]
+            },
+        )
+        result = self._run(client.batch_products(None, ["B000000001"]))
+        self.assertEqual(
+            result["B000000001"].status,
+            ObservationStatus.UNKNOWN,
+        )
+
+    def test_offer_object_without_offer_id_field_is_unknown(self):
+        client = self.make_client()
+        self._mock_batch_response(
+            client,
+            {
+                "products": [
+                    {
+                        "basicProduct": {"asin": "B000000001"},
+                        "basicOffer": {"price": "$10.00"},
+                    }
+                ]
+            },
+        )
+        result = self._run(client.batch_products(None, ["B000000001"]))
+        self.assertEqual(
+            result["B000000001"].status,
+            ObservationStatus.UNKNOWN,
+        )
+
+
+class TransitionDeduplicationTests(unittest.TestCase):
+    def test_only_one_inflight_transition_can_be_reserved(self):
+        state = AlertState()
+        state.commit("B000000001", False)
+        self.assertTrue(
+            state.reserve_transition(
+                "B000000001", ObservationStatus.IN_STOCK
+            )
+        )
+        self.assertFalse(
+            state.reserve_transition(
+                "B000000001", ObservationStatus.IN_STOCK
+            )
+        )
+
+    def test_failed_delivery_releases_reservation_for_retry(self):
+        state = AlertState()
+        state.commit("B000000001", False)
+        state.reserve_transition("B000000001", ObservationStatus.IN_STOCK)
+        state.finish_transition("B000000001", delivered=False)
+        self.assertTrue(
+            state.reserve_transition(
+                "B000000001", ObservationStatus.IN_STOCK
+            )
+        )
+
+    def test_unknown_does_not_reset_stock_state(self):
+        state = AlertState()
+        state.commit("B000000001", True)
+        self.assertFalse(
+            state.reserve_transition("B000000001", ObservationStatus.UNKNOWN)
+        )
+        self.assertFalse(state.peek("B000000001", True))
+
+
+class LatencyFormattingTests(unittest.TestCase):
+    def test_formats_received_path_latency(self):
+        self.assertEqual(format_path_latency(123.456), "123.5ms")
+
+    def test_formats_missing_receipt_as_timeout(self):
+        self.assertEqual(format_path_latency(None), "timeout")
+
+
+class SellerFilterTransitionTests(unittest.TestCase):
+    def test_filtered_offer_is_remembered_without_repeated_confirmation(self):
+        asin = "B000000001"
+        state = AlertState()
+        state.commit(asin, False)
+        self.assertTrue(
+            state.reserve_transition(asin, ObservationStatus.IN_STOCK)
+        )
+
+        client = types.SimpleNamespace(
+            product=AsyncMock(
+                return_value={
+                    "asin": asin,
+                    "in_stock": True,
+                    "soldByAmazon": False,
+                    "seller": "Third Party",
+                }
+            )
+        )
+        dispatcher = types.SimpleNamespace(
+            send_notification=AsyncMock(return_value=True)
+        )
+        config = MonitorConfig(
+            poll_interval_seconds=5.0,
+            groups=[],
+            require_amazon_seller=True,
+            fast_alert=False,
+        )
+
+        asyncio.run(
+            _handle_transition(
+                asin,
+                {},
+                {},
+                client,
+                None,
+                state,
+                asyncio.Lock(),
+                dispatcher,
+                AuthFailureWatch(),
+                asyncio.Semaphore(1),
+                config,
+                asyncio.Event(),
+            )
+        )
+
+        self.assertFalse(state.peek(asin, True))
+        self.assertFalse(state.has_inflight(asin))
+        dispatcher.send_notification.assert_not_awaited()
+
+
+class FastAlertPayloadTests(unittest.TestCase):
+    def test_batch_alert_never_claims_amazon_seller(self):
+        observation = BatchObservation(
+            asin="B000000001",
+            status=ObservationStatus.IN_STOCK,
+            price="$10.00",
+        )
+        product = product_from_batch("B000000001", observation)
+        payload = build_generic_payload(product, "GPU")
+        self.assertEqual(payload["signal"], "offer_detected")
+        self.assertFalse(payload["seller_verified"])
+        self.assertIsNone(payload["seller"])
+
+    def test_batch_embed_labels_unknown_seller(self):
+        product = product_from_batch(
+            "B000000001",
+            BatchObservation(
+                asin="B000000001",
+                status=ObservationStatus.IN_STOCK,
+            ),
+        )
+        embed = AlertDispatcher(session=None).create_embed(product)
+        field_value = embed.fields[0][1]["value"]
+        self.assertIn("Seller unconfirmed", field_value)
+        self.assertNotIn("Sold By:** Amazon.com", field_value)
+
+
+class CredentialRateControllerTests(unittest.TestCase):
+    def test_deadline_is_measured_from_request_start(self):
+        clock = FakeClock(100.0)
+        controller = CredentialRateController(2.0, clock=clock)
+        controller.mark_started()
+        clock.t = 101.25
+        self.assertAlmostEqual(controller.seconds_until_ready(), 0.75)
+
+    def test_rate_limit_installs_global_cooldown(self):
+        clock = FakeClock(10.0)
+        controller = CredentialRateController(
+            1.0,
+            cooldown_seconds=90.0,
+            clock=clock,
+        )
+        cooldown = controller.record_rate_limit(retry_after=12.0)
+        self.assertEqual(cooldown, 90.0)
+        self.assertEqual(controller.seconds_until_ready(), 90.0)
+        self.assertTrue(controller.snapshot()["consecutive_429"])
+        clock.t = 100.0
+        self.assertTrue(controller.consume_half_open_probe())
+        self.assertFalse(controller.consume_half_open_probe())
+
+    def test_client_raises_typed_rate_limit_with_retry_after(self):
+        class FakeResponse:
+            status = 429
+            headers = {"Retry-After": "17"}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def read(self):
+                return b""
+
+        class FakeSession:
+            def request(self, *_args, **_kwargs):
+                return FakeResponse()
+
+        with patch.dict(
+            os.environ,
+            {
+                "TVSS_COOKIE_HEADER": "session-id=1",
+                "PROXY_MODE": "direct",
+            },
+            clear=False,
+        ):
+            client = TVSSClient()
+        client.configure_rate_controller(1.0)
+
+        with self.assertRaises(TVSSRateLimitError) as raised:
+            asyncio.run(
+                client._request(
+                    FakeSession(),
+                    "GET",
+                    "https://tvss.amazon.com/test",
+                )
+            )
+
+        self.assertEqual(raised.exception.retry_after, 17.0)
+        self.assertGreaterEqual(
+            client.rate_controller.snapshot()["blocked_seconds"],
+            89.0,
+        )
+
+    def test_client_serializes_all_credential_traffic(self):
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            def __init__(self, owner):
+                self.owner = owner
+
+            async def __aenter__(self):
+                self.owner.active += 1
+                self.owner.max_active = max(
+                    self.owner.max_active,
+                    self.owner.active,
+                )
+                return self
+
+            async def __aexit__(self, *_args):
+                self.owner.active -= 1
+                return False
+
+            async def read(self):
+                await asyncio.sleep(0.001)
+                return b"{}"
+
+        class FakeSession:
+            def __init__(self):
+                self.active = 0
+                self.max_active = 0
+
+            def request(self, *_args, **_kwargs):
+                return FakeResponse(self)
+
+        with patch.dict(
+            os.environ,
+            {
+                "TVSS_COOKIE_HEADER": "session-id=1",
+                "PROXY_MODE": "direct",
+            },
+            clear=False,
+        ):
+            client = TVSSClient()
+        session = FakeSession()
+
+        async def concurrent_requests():
+            await asyncio.gather(
+                client._request(session, "GET", "https://tvss.amazon.com/one"),
+                client._request(session, "GET", "https://tvss.amazon.com/two"),
+            )
+
+        asyncio.run(concurrent_requests())
+        self.assertEqual(session.max_active, 1)
+
+
+class ProxyPoolTests(unittest.TestCase):
+    def test_webshare_format_normalizes_without_exposing_credentials(self):
+        normalized = normalize_proxy_url(
+            "proxy.example:8080:monitor-user:monitor-password"
+        )
+        self.assertTrue(normalized.startswith("http://"))
+        pool = ProxyPool([normalized])
+        rendered = repr(pool._health)
+        self.assertNotIn("monitor-user", rendered)
+        self.assertNotIn("monitor-password", rendered)
+
+    def test_quarantined_proxy_is_not_selected(self):
+        first = normalize_proxy_url("one.example:8000:u:p")
+        second = normalize_proxy_url("two.example:8000:u:p")
+        pool = ProxyPool([first, second], clock=FakeClock(0.0))
+        first_id = pool.ranked_route_ids()[0]
+        pool.record_failure(first_id, quarantine_seconds=30)
+        self.assertNotEqual(pool.ranked_route_ids()[0], first_id)
+
+    def test_network_route_list_allows_only_one_alternate(self):
+        proxies = [
+            normalize_proxy_url(f"proxy{i}.example:8000:u:p")
+            for i in range(20)
+        ]
+        pool = ProxyPool(proxies)
+        self.assertLessEqual(len(pool.request_routes()), 2)
+
+    def test_loads_twenty_entries_from_ignored_file_shape(self):
+        import tempfile
+
+        lines = [
+            f"proxy{i}.example:8000:user{i}:password{i}"
+            for i in range(20)
+        ]
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as handle:
+            handle.write("\n".join(lines))
+            path = handle.name
+        try:
+            urls = load_proxy_urls({"PROXY_POOL_FILE": path})
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(urls), 20)
+
+    def test_network_failures_do_not_log_proxy_credentials(self):
+        class FailingSession:
+            def request(self, *_args, **_kwargs):
+                raise aiohttp.ClientConnectionError(
+                    "failed via monitor-user:monitor-password"
+                )
+
+        with patch.dict(
+            os.environ,
+            {
+                "TVSS_COOKIE_HEADER": "session-id=1",
+                "PROXY_URL": (
+                    "http://monitor-user:monitor-password@proxy.example:8000"
+                ),
+                "PROXY_MODE": "fallback",
+            },
+            clear=False,
+        ):
+            client = TVSSClient()
+
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs(level="WARNING") as captured:
+                with self.assertRaises(RuntimeError) as raised:
+                    asyncio.run(
+                        client._request(
+                            FailingSession(),
+                            "GET",
+                            "https://tvss.amazon.com/test",
+                        )
+                    )
+        finally:
+            logging.disable(logging.CRITICAL)
+
+        rendered = "\n".join(captured.output) + str(raised.exception)
+        self.assertNotIn("monitor-user", rendered)
+        self.assertNotIn("monitor-password", rendered)
 
 
 class AuthModuleTests(unittest.TestCase):

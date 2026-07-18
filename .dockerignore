@@ -6,6 +6,8 @@ README.md
 agents.md
 LICENSE
 tests
+.claude
+.firecrawl
 __pycache__
 **/__pycache__
 *.pyc
@@ -15,3 +17,5 @@ endpoint.env
 .env.*
 .venv
 venv
+auth.json
+run_latency_probe.sh
