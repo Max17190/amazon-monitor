@@ -86,6 +86,7 @@ from main import (
     load_monitor_config,
     product_from_batch,
 )
+from latency_e2e import format_path_latency
 from webhooks import WebhookTarget, load_webhook_targets
 
 
@@ -576,7 +577,7 @@ class BatchProductsParseTests(unittest.TestCase):
         self.assertFalse(result["B0DTJFSSZG"]["has_offer"])
         self.assertIsNone(result["B0DTJFSSZG"]["price"])
 
-    def test_missing_asin_filled_as_no_offer(self):
+    def test_missing_asin_has_no_offer_signal(self):
         client = self.make_client()
         self._mock_batch_response(client, {"products": []})
         result = self._run(client.batch_products(None, ["B000MISSING"]))
@@ -758,6 +759,14 @@ class TransitionDeduplicationTests(unittest.TestCase):
             state.reserve_transition("B000000001", ObservationStatus.UNKNOWN)
         )
         self.assertFalse(state.peek("B000000001", True))
+
+
+class LatencyFormattingTests(unittest.TestCase):
+    def test_formats_received_path_latency(self):
+        self.assertEqual(format_path_latency(123.456), "123.5ms")
+
+    def test_formats_missing_receipt_as_timeout(self):
+        self.assertEqual(format_path_latency(None), "timeout")
 
 
 class FastAlertPayloadTests(unittest.TestCase):

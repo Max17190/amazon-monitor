@@ -137,6 +137,10 @@ def stats_line(vals):
     )
 
 
+def format_path_latency(value):
+    return f"{value:.1f}ms" if value is not None else "timeout"
+
+
 def batch_asins(selected_asin):
     configured = [
         value.strip().upper()
@@ -354,13 +358,16 @@ async def run_probe():
                 "poll_to_webhook_received_ms": path_ms if ok else None,
             }
             results.append(row)
+            path_display = format_path_latency(
+                row["poll_to_webhook_received_ms"]
+            )
             print(
                 f"rep {i}: batch_total={row['batch_total_ms']:8.1f}ms "
                 f"batch_success={row['batch_success_ms']:6.1f}ms "
                 f"attempts={row['batch_attempts']} 429s={row['batch_429s']} "
                 f"product_total={row['product_total_ms']:8.1f}ms "
                 f"webhook={row['webhook_send_ms']:6.1f}ms "
-                f"path={row['poll_to_webhook_received_ms']:.1f}ms "
+                f"path={path_display} "
                 f"delivered={delivered} recv={ok}"
             )
             if receipts:
