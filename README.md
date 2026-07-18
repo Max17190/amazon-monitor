@@ -277,7 +277,11 @@ LOG_LEVEL=INFO
 | `DATABASE_URL` | required | Shared Postgres authority for leases, stock state, transitions, and alert delivery. |
 | `MONITOR_ID` | required | Stable deployment identity used in stock-state scope keys. |
 | `TVSS_CREDENTIAL_ID` | device identity | Stable non-secret identity for one Amazon credential budget. |
-| `POLL_INTERVAL_SECONDS` | `5.0` | Credential-wide request-start cadence. Production rejects values below `5.0`; calibration mode is the only exception. |
+| `POLL_INTERVAL_SECONDS` | `5.0` | Credential-wide request-start cadence. Requested values below `5.0` require a matching valid direct calibration; otherwise production uses `5.0`. |
+| `TVSS_CALIBRATION_VALIDITY_SECONDS` | `86400` | Maximum age of a direct, error-free 120-observation calibration. |
+| `FAST_ALERT_CONFIRM_EVERY_POLLS` | `12` | Latency-profile confirmation slot limit. This prevents confirmations from consuming every batch slot. |
+| `ALERT_OUTBOX_FALLBACK_POLL_SECONDS` | `1` | Crash-recovery scan interval when an outbox wakeup notification is missed. |
+| `ALERT_CONNECTION_WARM_SECONDS` | `90` | Idle Discord connection refresh cadence in the latency profile. |
 | `TVSS_CONCURRENCY` | `20` | Per-ASIN-mode semaphore (only used when `MONITOR_USE_BATCH=false`). Ignored in batch mode. |
 | `TVSS_TIMEOUT` | `5` | TVSS request timeout in seconds. |
 | `TVSS_429_COOLDOWN_SECONDS` | `900` | Minimum credential-wide cooldown after HTTP 429. `Retry-After` is honored when longer. |
@@ -302,7 +306,7 @@ LOG_LEVEL=INFO
 | `ALERT_CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive transient target failures before opening its circuit. |
 | `ALERT_CIRCUIT_OPEN_SECONDS` | `60` | Target circuit open duration. |
 | `ALERT_DEAD_LETTER_RETENTION_DAYS` | `30` | Dead-letter audit retention before cleanup. |
-| `STOCK_CONFIRM_TTL_SECONDS` | `30` | Maximum age for a full-product confirmation job. |
+| `STOCK_CONFIRM_TTL_SECONDS` | `90` | Maximum age for a full-product confirmation job. |
 | `STOCK_OOS_REARM_COUNT` | `2` | Strong, cadence-separated out-of-stock observations required to rearm. Values below two are rejected. |
 | `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics. |
 | `PROXY_URL` | unset | Optional HTTP proxy URL. Credentials are never logged. |
@@ -310,6 +314,11 @@ LOG_LEVEL=INFO
 | `PROXY_POOL_FILE` | unset | Ignored local proxy file with one URL or Webshare entry per line. |
 | `PROXY_MODE` | `fallback` | `fallback`: direct first, then a ranked alternate only on network failure. HTTP 429 never rotates proxies. `always`: proxy first. |
 | `LOG_LEVEL` | `INFO` | `INFO` or `DEBUG`. Per-poll status lines are at `DEBUG`. |
+
+`endpoint.latency.env.example` is the low-latency overlay. It enables the
+clearly labeled speculative alert, requests calibrated 0.5-second polling,
+throttles confirmations to one slot per 12 successful batch polls, and keeps
+the push-driven outbox and Discord connection warmer active.
 
 Each successful batch emits a structured `tvss_stage` record with request wall
 time, response read, JSON decode, state evaluation, alert-task scheduling,
@@ -331,6 +340,10 @@ The bounded `us-east4-eqdc4a` canary selected a 5-second cadence. Its final
 60-observation validation completed with zero 429s at 109.8 ms p50 and
 223.7 ms p95. The internal response-read-through-dispatch benchmark measured
 0.054 ms p95 on the same Railway run.
+
+The real worst-case detection bound is the effective calibrated poll interval
+plus TVSS p95, internal durable-path p95, and webhook p95. Subsecond alert
+claims are valid only when a matching live calibration authorizes that cadence.
 
 A subsequent [20-ASIN transport bakeoff](docs/tvss-transport-benchmark.md)
 compared aiohttp with curl_cffi HTTP/1.1, HTTP/2, and pinned Chrome-profile
@@ -360,7 +373,7 @@ Response time does not get added to the interval.
 
 When to lower `POLL_INTERVAL_SECONDS`:
 
-- A 20-ASIN `cadence_canary.py` run completed its discovery and 60-observation validation with zero 429s.
+- A direct 20-ASIN `cadence_canary.py` run completed its discovery and 120-observation validation with zero 429s or network errors.
 
 When to raise it:
 
@@ -386,9 +399,13 @@ What it does:
 
 1. Runs 60-second discovery buckets at `5`, `3`, `2`, `1.5`, `1`, `0.75`, and `0.5` seconds.
 2. Stops the ladder immediately on the first 429 and does not test faster buckets.
-3. Waits 15 minutes, then validates the fastest clean interval for 60 consecutive observations.
-4. A validation 429 selects the next slower interval after another quiet period.
-5. Accepts only a clean 60-observation validation with direct p50 at or below 119.9 ms.
+3. Waits 15 minutes, then validates the fastest clean interval for 120 consecutive observations.
+4. Any 429 immediately invalidates the credential calibration and ends the run.
+5. Emits a machine-readable calibration record keyed by credential hash, marketplace, region, direct route, and batch size. Only a clean 120-observation validation with direct p50 at or below 119.9 ms may unlock a sub-five-second cadence.
+
+Production fails closed to `5.0` seconds for a missing, expired (24 hours),
+mismatched, invalidated, proxy-routed, or incomplete calibration. A 429
+invalidates every calibration for that credential and marketplace.
 
 The command requires `--confirm` because it uses live TVSS credentials.
 
@@ -516,6 +533,18 @@ Run the internal acceptance benchmark before using credentials:
 python hot_path_benchmark.py --iterations 10000
 ```
 
+With a disposable Postgres database, exercise the complete durable path and
+local webhook acceptance:
+
+```sh
+TEST_DATABASE_URL=postgresql://monitor:monitor@localhost:5432/amazon_monitor \
+python durable_latency_benchmark.py --confirm-database-writes
+```
+
+This requires 20-ASIN response-to-commit p95 below 10 ms,
+commit-to-first-attempt p95 below 10 ms, and response-to-local-acceptance p95
+below 25 ms. The benchmark removes its uniquely scoped rows on completion.
+
 Run public proxy health checks without authenticated TVSS traffic:
 
 ```sh
@@ -642,6 +671,8 @@ Run:
 python -m py_compile main.py webhooks.py amazon_tvss.py amazon_auth.py tvss_runtime.py
 python -m unittest discover -s tests
 python hot_path_benchmark.py --iterations 10000
+TEST_DATABASE_URL=postgresql://monitor:monitor@localhost:5432/amazon_monitor \
+python durable_latency_benchmark.py --confirm-database-writes
 ```
 
 Full live verification requires valid Amazon TVSS credentials and at least one working webhook target.

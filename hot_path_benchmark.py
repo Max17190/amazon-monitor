@@ -71,7 +71,7 @@ async def run(iterations):
         "p95_ms": round(percentile(samples_ms, 95), 6),
         "p99_ms": round(percentile(samples_ms, 99), 6),
         "max_ms": round(max(samples_ms), 6),
-        "acceptance_p95_ms": 1.0,
+        "acceptance_p95_ms": 0.1,
     }
     result["accepted"] = result["p95_ms"] < result["acceptance_p95_ms"]
     print(json.dumps(result, sort_keys=True))

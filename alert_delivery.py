@@ -8,15 +8,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import inspect
 import logging
 import random
 import time
+from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import Enum
-from typing import Any, Awaitable, Callable, Mapping, Protocol
+from typing import Any, Awaitable, Callable, Iterable, Mapping, Protocol
 
 import aiohttp
 
@@ -76,6 +78,7 @@ class AlertDelivery:
     leased_until: float | None = None
     status: DeliveryStatus = DeliveryStatus.PENDING
     trace_context: str | None = None
+    claimed_at: float | None = None
 
     @property
     def idempotency_key(self) -> str:
@@ -91,7 +94,14 @@ class DeliveryAttempt:
 
 
 class OutboxRepository(Protocol):
-    async def claim_due(self, *, limit: int, now: float, lease_seconds: float) -> list[AlertDelivery]: ...
+    async def claim_due(
+        self,
+        *,
+        limit: int,
+        now: float,
+        lease_seconds: float,
+        preferred_delivery_ids: Iterable[str] | None = None,
+    ) -> list[AlertDelivery]: ...
     async def succeed(
         self, delivery_id: str, *, delivered_at: float,
         status_code: int | None, duration_seconds: float,
@@ -109,6 +119,78 @@ class OutboxRepository(Protocol):
 
 class DeliverySender(Protocol):
     async def send(self, delivery: AlertDelivery) -> DeliveryAttempt: ...
+
+
+class OutboxWakeup:
+    """Coalesce local commits and cross-replica notifications into one wakeup.
+
+    The commit path calls :meth:`wake` only after its transaction commits.  A
+    worker consumes the accumulated IDs atomically with clearing the event, so
+    commits arriving during a delivery drain cause another immediate pass.
+    """
+
+    def __init__(self) -> None:
+        self._event = asyncio.Event()
+        self._preferred_delivery_ids: set[str] = set()
+        self._woken_at: dict[str, float] = {}
+
+    def wake(self, delivery_ids: Iterable[str] = ()) -> None:
+        now = time.time()
+        for value in delivery_ids:
+            delivery_id = str(value)
+            self._preferred_delivery_ids.add(delivery_id)
+            self._woken_at.setdefault(delivery_id, now)
+        self._event.set()
+
+    notify = wake
+
+    def take_preferred_delivery_ids(self) -> tuple[str, ...]:
+        """Return and clear coalesced preferred IDs without blocking."""
+        preferred = tuple(sorted(self._preferred_delivery_ids))
+        self._preferred_delivery_ids.clear()
+        self._event.clear()
+        return preferred
+
+    async def wait(self) -> tuple[str, ...]:
+        """Wait until a local or database notification is received."""
+        await self._event.wait()
+        return self.take_preferred_delivery_ids()
+
+    def pop_wake_time(self, delivery_id: str) -> float | None:
+        return self._woken_at.pop(str(delivery_id), None)
+
+
+class PostgresOutboxNotificationAdapter:
+    """Small adapter for a Postgres LISTEN callback supplied by runtime code.
+
+    The durable runtime owns the database connection and calls
+    :meth:`on_notification` from its listener. Payloads may be a delivery ID,
+    a JSON array of IDs, or an object containing ``delivery_ids``. Invalid
+    payloads still wake the worker so the one-second fallback is not the only
+    recovery mechanism.
+    """
+
+    def __init__(self, wakeup: OutboxWakeup) -> None:
+        self.wakeup = wakeup
+
+    def on_notification(self, payload: str | bytes | None) -> None:
+        delivery_ids: Iterable[str] = ()
+        if payload:
+            try:
+                decoded = json.loads(payload)
+                if isinstance(decoded, str):
+                    delivery_ids = (decoded,)
+                elif isinstance(decoded, list):
+                    delivery_ids = (value for value in decoded if isinstance(value, str))
+                elif isinstance(decoded, dict):
+                    values = decoded.get("delivery_ids", ())
+                    if isinstance(values, list):
+                        delivery_ids = (value for value in values if isinstance(value, str))
+            except (TypeError, ValueError):
+                if isinstance(payload, bytes):
+                    payload = payload.decode("utf-8", errors="ignore")
+                delivery_ids = (payload,) if isinstance(payload, str) and payload else ()
+        self.wakeup.wake(delivery_ids)
 
 
 def _delivery_span(delivery: AlertDelivery):
@@ -185,6 +267,16 @@ def decorrelated_jitter(previous_delay: float, *, base: float = 0.5, cap: float 
     return min(cap, rng(base, max(base, previous_delay * 3)))
 
 
+def _detected_timestamp(delivery: AlertDelivery) -> float:
+    value = delivery.payload.get("detected_at")
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            pass
+    return delivery.created_at
+
+
 @dataclass
 class CircuitBreaker:
     failure_threshold: int = DEFAULT_CIRCUIT_FAILURE_THRESHOLD
@@ -257,12 +349,16 @@ class AlertDeliveryWorker:
                  rng: Callable[[float, float], float] = random.uniform,
                  max_backoff_seconds: float = DEFAULT_MAX_BACKOFF_SECONDS,
                  circuit_failure_threshold: int = DEFAULT_CIRCUIT_FAILURE_THRESHOLD,
-                 circuit_open_seconds: float = DEFAULT_CIRCUIT_OPEN_SECONDS):
+                 circuit_open_seconds: float = DEFAULT_CIRCUIT_OPEN_SECONDS,
+                 wakeup: OutboxWakeup | None = None,
+                 fallback_poll_seconds: float = 1.0):
         self.repository, self.sender = repository, sender
         self.metrics = metrics or DeliveryMetrics()
         self.health = health or DeliveryHealth(repository_ready=True)
         if concurrency < 1 or per_target_concurrency < 1:
             raise ValueError("delivery concurrency limits must be at least one")
+        if fallback_poll_seconds <= 0:
+            raise ValueError("fallback poll interval must be positive")
         self.claim_limit = concurrency
         self.concurrency = asyncio.Semaphore(concurrency)
         self.per_target_concurrency = per_target_concurrency
@@ -271,31 +367,129 @@ class AlertDeliveryWorker:
         self.max_backoff_seconds = float(max_backoff_seconds)
         self.circuit_failure_threshold = int(circuit_failure_threshold)
         self.circuit_open_seconds = float(circuit_open_seconds)
+        self.wakeup = wakeup or OutboxWakeup()
+        self.fallback_poll_seconds = float(fallback_poll_seconds)
         self._target_limits: dict[str, asyncio.Semaphore] = {}
         self._breakers: dict[str, CircuitBreaker] = {}
         self._stopping = asyncio.Event()
+        self._claim_supports_preferred_ids: bool | None = None
 
     def stop(self) -> None:
         self.health.stopping = True
         self._stopping.set()
+        self.wakeup.wake()
 
-    async def run_once(self, *, limit: int | None = None) -> int:
+    def wake(self, delivery_ids: Iterable[str] = ()) -> None:
+        """Schedule an immediate, preferred delivery drain after outbox commit."""
+        self.wakeup.wake(delivery_ids)
+
+    def _supports_preferred_claims(self) -> bool:
+        if self._claim_supports_preferred_ids is not None:
+            return self._claim_supports_preferred_ids
+        try:
+            parameters = inspect.signature(self.repository.claim_due).parameters.values()
+            self._claim_supports_preferred_ids = any(
+                parameter.name == "preferred_delivery_ids"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            )
+        except (TypeError, ValueError):
+            # Conservative compatibility path for opaque repository adapters.
+            self._claim_supports_preferred_ids = False
+        return self._claim_supports_preferred_ids
+
+    async def _claim_due(
+        self,
+        *,
+        limit: int,
+        now: float,
+        preferred_delivery_ids: Iterable[str] = (),
+    ) -> list[AlertDelivery]:
+        preferred = tuple(preferred_delivery_ids)
+        kwargs: dict[str, Any] = {
+            "limit": limit,
+            "now": now,
+            "lease_seconds": self.lease_seconds,
+        }
+        if preferred and self._supports_preferred_claims():
+            kwargs["preferred_delivery_ids"] = preferred
+        return await self.repository.claim_due(**kwargs)
+
+    async def run_once(
+        self,
+        *,
+        limit: int | None = None,
+        preferred_delivery_ids: Iterable[str] = (),
+    ) -> int:
         if self._stopping.is_set():
             return 0
         now = self.clock()
         self.health.repository_ready = True
-        claimed = await self.repository.claim_due(limit=limit or self.claim_limit, now=now,
-                                                  lease_seconds=self.lease_seconds)
+        claimed = await self._claim_due(
+            limit=limit or self.claim_limit,
+            now=now,
+            preferred_delivery_ids=preferred_delivery_ids,
+        )
         self.metrics.set_gauge("alert_outbox_claimed", len(claimed))
         await asyncio.gather(*(self._deliver(row) for row in claimed))
         return len(claimed)
 
-    async def run(self, *, poll_interval_seconds: float = 0.25) -> None:
+    async def _drain(self, *, preferred_delivery_ids: Iterable[str] = ()) -> int:
+        """Drain due work, merging committed IDs before each later claim."""
+        total = 0
+        pending_preferred: deque[str] = deque()
+        queued_preferred: set[str] = set()
+
+        def enqueue_preferred(delivery_ids: Iterable[str]) -> None:
+            for delivery_id in delivery_ids:
+                if delivery_id not in queued_preferred:
+                    pending_preferred.append(delivery_id)
+                    queued_preferred.add(delivery_id)
+
+        enqueue_preferred(preferred_delivery_ids)
+        while not self._stopping.is_set():
+            # Commits can arrive while a prior batch is delivered. Merge them
+            # immediately before every claim, then consume one bounded FIFO
+            # slice. Each ID gets one priority opportunity, so stale or
+            # capacity-blocked IDs cannot grow the SQL parameter throughout a
+            # sustained backlog.
+            enqueue_preferred(self.wakeup.take_preferred_delivery_ids())
+            preferred = tuple(
+                pending_preferred.popleft()
+                for _ in range(min(self.claim_limit, len(pending_preferred)))
+            )
+            queued_preferred.difference_update(preferred)
+            claimed = await self.run_once(
+                preferred_delivery_ids=preferred,
+            )
+            total += claimed
+            if not claimed:
+                if pending_preferred:
+                    continue
+                return total
+        return total
+
+    async def run(self, *, poll_interval_seconds: float | None = None) -> None:
+        """Run on commit notifications with a bounded missed-notification scan.
+
+        ``poll_interval_seconds`` remains accepted for older callers, but its
+        default is now a one-second fallback rather than the old 250 ms idle
+        delay.
+        """
+        fallback_seconds = (
+            self.fallback_poll_seconds
+            if poll_interval_seconds is None
+            else float(poll_interval_seconds)
+        )
+        if fallback_seconds <= 0:
+            raise ValueError("poll interval must be positive")
         self.health.worker_running = True
+        preferred = self.wakeup.take_preferred_delivery_ids()
         try:
             while not self._stopping.is_set():
                 try:
-                    await self.run_once()
+                    await self._drain(preferred_delivery_ids=preferred)
+                    preferred = ()
                     self.health.repository_ready = True
                     self.health.last_error = None
                 except asyncio.CancelledError:
@@ -308,10 +502,16 @@ class AlertDeliveryWorker:
                         labels={"class": type(exc).__name__},
                     )
                     logging.exception("Alert delivery worker iteration failed")
+                if self._stopping.is_set():
+                    break
                 try:
-                    await asyncio.wait_for(self._stopping.wait(), timeout=poll_interval_seconds)
+                    preferred = await asyncio.wait_for(
+                        self.wakeup.wait(), timeout=fallback_seconds
+                    )
                 except asyncio.TimeoutError:
-                    pass
+                    # A fallback scan recovers rows after process crashes or a
+                    # missed LISTEN/NOTIFY event.
+                    preferred = ()
         finally:
             self.health.worker_running = False
 
@@ -346,6 +546,12 @@ class AlertDeliveryWorker:
         target_limit = self._target_limits.setdefault(delivery.target.target_id, asyncio.Semaphore(self.per_target_concurrency))
         async with self.concurrency, target_limit:
             started = time.monotonic()
+            if delivery.claimed_at is not None:
+                self.metrics.observe(
+                    "alert_claim_to_attempt_seconds",
+                    max(0.0, self.clock() - delivery.claimed_at),
+                    labels=labels,
+                )
             original_trace_context = delivery.trace_context
             try:
                 with _delivery_span(delivery) as span:
@@ -379,6 +585,11 @@ class AlertDeliveryWorker:
             self.metrics.observe(
                 "alert_detect_to_target_success_seconds",
                 max(0.0, self.clock() - delivery.created_at),
+                labels=labels,
+            )
+            self.metrics.observe(
+                "alert_detect_to_accept_seconds",
+                max(0.0, self.clock() - _detected_timestamp(delivery)),
                 labels=labels,
             )
             logging.info(
