@@ -11,6 +11,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from amazon_tvss import TVSSClient, TVSSRateLimitError
+from durable_runtime import exclusive_canary_lease
 from tvss_runtime import ProxyPool, load_proxy_urls
 
 
@@ -108,37 +109,41 @@ async def run(args):
         ttl_dns_cache=300,
         keepalive_timeout=120,
     )
-    async with aiohttp.ClientSession(connector=tvss_connector) as session:
-        for index, route in enumerate(top_routes):
-            if index:
-                await asyncio.sleep(args.tvss_spacing)
-            client.proxy_pool = ProxyPool(
-                [route.url],
-                mode="always",
-                allow_network_fallback=False,
-            )
-            started = time.perf_counter()
-            try:
-                await client.batch_products(session, asins)
-                outcome = "ok"
-            except TVSSRateLimitError:
-                outcome = "rate_limited"
-            except Exception:
-                outcome = "error"
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            print(
-                json.dumps(
-                    {
-                        "stage": "proxy_tvss",
-                        "route": route.route_id,
-                        "outcome": outcome,
-                        "latency_ms": round(latency_ms, 3),
-                    },
-                    sort_keys=True,
+    async with exclusive_canary_lease(
+        client,
+        base_interval=args.tvss_spacing,
+    ):
+        async with aiohttp.ClientSession(connector=tvss_connector) as session:
+            for index, route in enumerate(top_routes):
+                if index:
+                    await asyncio.sleep(args.tvss_spacing)
+                client.proxy_pool = ProxyPool(
+                    [route.url],
+                    mode="always",
+                    allow_network_fallback=False,
                 )
-            )
-            if outcome == "rate_limited":
-                break
+                started = time.perf_counter()
+                try:
+                    await client.batch_products(session, asins)
+                    outcome = "ok"
+                except TVSSRateLimitError:
+                    outcome = "rate_limited"
+                except Exception:
+                    outcome = "error"
+                latency_ms = (time.perf_counter() - started) * 1000.0
+                print(
+                    json.dumps(
+                        {
+                            "stage": "proxy_tvss",
+                            "route": route.route_id,
+                            "outcome": outcome,
+                            "latency_ms": round(latency_ms, 3),
+                        },
+                        sort_keys=True,
+                    )
+                )
+                if outcome == "rate_limited":
+                    break
 
     return 0
 

@@ -16,4 +16,6 @@ RUN useradd --create-home --shell /usr/sbin/nologin monitor \
     && chown -R monitor:monitor /app
 USER monitor
 
+EXPOSE 9090
+
 CMD ["python", "main.py"]

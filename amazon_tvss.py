@@ -14,6 +14,7 @@ from urllib.parse import urlencode
 
 import aiohttp
 
+from credential_governor import RequestClass
 from tvss_runtime import CredentialRateController, DIRECT_ROUTE_ID, ProxyPool
 
 
@@ -42,6 +43,9 @@ class BatchObservation:
     status: ObservationStatus
     price: object = None
     availability_condition: object = None
+    offer_id: object = None
+    response_complete: bool = False
+    offer_explicitly_null: object = None
 
     @property
     def has_offer(self):
@@ -58,6 +62,12 @@ class BatchObservation:
             return self.price
         if key == "availability_condition":
             return self.availability_condition
+        if key == "offer_id":
+            return self.offer_id
+        if key == "response_complete":
+            return self.response_complete
+        if key == "offer_explicitly_null":
+            return self.offer_explicitly_null
         return default
 
     def __getitem__(self, key):
@@ -137,7 +147,10 @@ class TVSSClient:
         self.domain = os.getenv("TVSS_DOMAIN", DEFAULT_DOMAIN)
         self.base_url = os.getenv("TVSS_BASE_URL", TVSS_BASE_URL).rstrip("/")
         self.currency = os.getenv("TVSS_CURRENCY", "USD")
-        self.device_udid = os.getenv("TVSS_DEVICE_UDID") or os.urandom(16).hex()
+        configured_udid = os.getenv("TVSS_DEVICE_UDID")
+        auth_udid = self._load_device_udid_from_auth_state()
+        self.device_udid = configured_udid or auth_udid or os.urandom(16).hex()
+        self.has_stable_device_identity = bool(configured_udid or auth_udid)
         self.cookie_header = self._load_cookie_header()
 
         # Fallback: if no env-var cookies, try loading from auth.json
@@ -190,11 +203,17 @@ class TVSSClient:
         except (TypeError, ValueError) as exc:
             raise TVSSConfigError(f"invalid proxy configuration: {exc}") from exc
         self.rate_controller = None
+        self.durable_governor = None
+        self.credential_key = None
         self.last_request_timing = TVSSRequestTiming()
         self._traffic_lock = None
         self._request_timing = contextvars.ContextVar(
             f"tvss_request_timing_{id(self)}",
             default=None,
+        )
+        self._request_class = contextvars.ContextVar(
+            f"tvss_request_class_{id(self)}",
+            default=RequestClass.CONFIRM,
         )
 
     @property
@@ -211,6 +230,18 @@ class TVSSClient:
             additive_decrease=float(os.getenv("TVSS_INTERVAL_DECREMENT", "0.05")),
         )
         return self.rate_controller
+
+    def configure_durable_governor(self, governor, credential_key, owner_id=None):
+        if not credential_key:
+            raise TVSSConfigError("credential_key is required for durable governor")
+        self.durable_governor = governor
+        self.credential_key = credential_key
+        # Durable callers must provide the leader identity.  It is checked
+        # immediately before each physical request so a stale replica cannot
+        # spend a permit after a lease takeover.
+        self.credential_owner_id = owner_id
+        self.rate_controller = None
+        return governor
 
     def enable_proxy_fallback(self):
         """Select the best healthy proxy for the next half-open recovery probe."""
@@ -252,6 +283,16 @@ class TVSSClient:
         if state and state.get("state") == "authenticated" and state.get("cookies"):
             return cookies_to_header(state["cookies"])
         return ""
+
+    @staticmethod
+    def _load_device_udid_from_auth_state():
+        from amazon_auth import load_auth_state
+
+        state = load_auth_state()
+        device = state.get("device") if isinstance(state, dict) else None
+        if not isinstance(device, dict):
+            return ""
+        return str(device.get("device_serial") or "").strip()
 
     def _cookie_value(self, name):
         if not self.cookie_header:
@@ -298,7 +339,15 @@ class TVSSClient:
             except (TypeError, ValueError, OverflowError):
                 return None
 
-    async def _request(self, session, method, url, json_body=None):
+    async def _request(
+        self,
+        session,
+        method,
+        url,
+        json_body=None,
+        request_class=None,
+    ):
+        request_class = request_class or self._request_class.get()
         if self._traffic_lock is None:
             self._traffic_lock = asyncio.Lock()
         queued_ns = time.perf_counter_ns()
@@ -310,6 +359,7 @@ class TVSSClient:
                 url,
                 json_body=json_body,
                 credential_queue_ms=queue_ms,
+                request_class=request_class,
             )
 
     async def _request_serialized(
@@ -319,10 +369,11 @@ class TVSSClient:
         url,
         json_body=None,
         credential_queue_ms=0.0,
+        request_class=RequestClass.CONFIRM,
     ):
         timing = TVSSRequestTiming()
         timing.credential_queue_ms = credential_queue_ms
-        if self.rate_controller is not None:
+        if self.rate_controller is not None and self.durable_governor is None:
             _, wait_seconds, half_open = await self.rate_controller.acquire()
             timing.cadence_wait_ms = wait_seconds * 1000.0
             timing.half_open_probe = half_open
@@ -332,6 +383,24 @@ class TVSSClient:
         last_network_error = None
 
         for attempt, route in enumerate(routes, start=1):
+            permit = None
+            if self.durable_governor is not None:
+                permit = await self.durable_governor.acquire_permit(
+                    self.credential_key,
+                    request_class,
+                    owner_id=self.credential_owner_id,
+                )
+                if permit.wait_seconds:
+                    await asyncio.sleep(permit.wait_seconds)
+                # A permit can wait for a full cadence slot. Revalidate after
+                # that wait at the network boundary, not only when reserving.
+                if self.credential_owner_id is not None:
+                    await self.durable_governor.ensure_leader(
+                        self.credential_key,
+                        self.credential_owner_id,
+                    )
+                timing.cadence_wait_ms += permit.wait_seconds * 1000.0
+                timing.half_open_probe = permit.half_open_probe
             attempt_started_ns = time.perf_counter_ns()
             timing.attempts = attempt
             timing.route_id = route.route_id
@@ -353,6 +422,10 @@ class TVSSClient:
                     ) / 1_000_000
 
                     if response.status in (401, 403):
+                        if permit is not None:
+                            await self.durable_governor.record_result(
+                                permit, response.status
+                            )
                         self.last_request_timing = timing
                         raise TVSSConfigError(
                             f"TVSS auth rejected with HTTP {response.status}"
@@ -362,14 +435,24 @@ class TVSSClient:
                         retry_after = self._retry_after_seconds(
                             response.headers.get("Retry-After")
                         )
-                        if not route.is_direct:
+                        if (
+                            not route.is_direct
+                            and self.durable_governor is None
+                        ):
                             self.proxy_pool.record_failure(
                                 route.route_id,
                                 quarantine_seconds=max(retry_after or 0.0, 90.0),
                             )
-                        if self.rate_controller is not None:
+                        if permit is not None:
+                            await self.durable_governor.record_result(
+                                permit,
+                                response.status,
+                                retry_after,
+                            )
+                        elif self.rate_controller is not None:
                             self.rate_controller.record_rate_limit(retry_after)
-                        self.enable_proxy_fallback()
+                        if self.durable_governor is None:
+                            self.enable_proxy_fallback()
                         self.last_request_timing = timing
                         self._request_timing.set(timing)
                         raise TVSSRateLimitError(
@@ -380,13 +463,21 @@ class TVSSClient:
                         )
 
                     if response.status < 200 or response.status >= 300:
+                        if permit is not None:
+                            await self.durable_governor.record_result(
+                                permit, response.status
+                            )
                         self.last_request_timing = timing
                         raise RuntimeError(
                             f"TVSS HTTP {response.status} (body_len={len(body)})"
                         )
 
                     self.proxy_pool.record_success(route.route_id, attempt_ms)
-                    if self.rate_controller is not None:
+                    if permit is not None:
+                        await self.durable_governor.record_result(
+                            permit, response.status
+                        )
+                    elif self.rate_controller is not None:
                         self.rate_controller.record_success()
 
                     if not body:
@@ -408,6 +499,8 @@ class TVSSClient:
                 raise
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 last_network_error = exc
+                if permit is not None:
+                    await self.durable_governor.record_result(permit, None)
                 self.proxy_pool.record_failure(route.route_id)
                 logging.warning(
                     "TVSS network failure route=%s attempt=%s",
@@ -426,7 +519,11 @@ class TVSSClient:
 
     async def product(self, session, asin):
         url = f"{self._product_url_prefix}{asin}?sif_profile=tvss"
-        data = await self._request(session, "GET", url)
+        token = self._request_class.set(RequestClass.CONFIRM)
+        try:
+            data = await self._request(session, "GET", url)
+        finally:
+            self._request_class.reset(token)
         return self._parse_product(data, asin)
 
     async def batch_products(self, session, asins):
@@ -447,7 +544,11 @@ class TVSSClient:
             )
         joined = ",".join(asins)
         url = f"{self._basicproducts_url_prefix}{joined}?get-deals=false&sif_profile=tvss"
-        data = await self._request(session, "GET", url)
+        token = self._request_class.set(RequestClass.POLL)
+        try:
+            data = await self._request(session, "GET", url)
+        finally:
+            self._request_class.reset(token)
         result = self.parse_batch_response(data, asins)
         result.timing = self._request_timing.get() or self.last_request_timing
         return result
@@ -496,6 +597,9 @@ class TVSSClient:
                     asin=asin,
                     status=ObservationStatus.OUT_OF_STOCK,
                     availability_condition=availability,
+                    offer_id=None,
+                    response_complete=bool(availability),
+                    offer_explicitly_null=True,
                 )
                 continue
             if not isinstance(basic_offer, dict):
@@ -513,6 +617,9 @@ class TVSSClient:
                 status=status,
                 price=basic_offer.get("price"),
                 availability_condition=availability,
+                offer_id=basic_offer.get("offerId"),
+                response_complete=True,
+                offer_explicitly_null=False,
             )
 
         return BatchPollResult(observations)
@@ -526,24 +633,40 @@ class TVSSClient:
         return cls.parse_batch_response(data, asins)
 
     def _parse_product(self, data, fallback_asin):
+        response_complete = isinstance(data, dict) and bool(data)
         if not isinstance(data, dict):
             data = {}
 
-        asin = data.get("asin") or fallback_asin
-        availability = data.get("productAvailabilityDetails") or {}
-        if not isinstance(availability, dict):
+        returned_asin = data.get("asin")
+        if returned_asin != fallback_asin:
+            response_complete = False
+        asin = fallback_asin
+        raw_availability = data.get("productAvailabilityDetails")
+        availability = raw_availability or {}
+        if raw_availability is not None and not isinstance(
+            raw_availability,
+            dict,
+        ):
             availability = {}
+            response_complete = False
 
-        offer_id = (
+        raw_offer_id = (
             data.get("offerId")
             or data.get("offerListingId")
             or data.get("buyingOptionId")
             or ""
         )
+        if raw_offer_id and not isinstance(raw_offer_id, str):
+            response_complete = False
+            offer_id = ""
+        else:
+            offer_id = raw_offer_id
         price = self._format_price(data.get("price"))
-        merchant = data.get("merchantInfo") or {}
-        if not isinstance(merchant, dict):
+        raw_merchant = data.get("merchantInfo")
+        merchant = raw_merchant or {}
+        if raw_merchant is not None and not isinstance(raw_merchant, dict):
             merchant = {}
+            response_complete = False
         images = self._image_urls(data.get("productImageUrls"))
         buyable = self._has_buyable_signal(data, availability, offer_id)
 
@@ -558,8 +681,15 @@ class TVSSClient:
             "offerId": offer_id,
             "availability": availability,
             "seller": merchant.get("merchantName"),
+            "seller_id": merchant.get("merchantId"),
             "soldByAmazon": merchant.get("soldByAmazon"),
             "seller_verified": bool(merchant.get("merchantName")),
+            "response_complete": response_complete,
+            "buyable_signals": tuple(
+                key
+                for key in ("canAddToCart", "isBuyable", "buyable", "available")
+                if data.get(key) is True or availability.get(key) is True
+            ),
         }
 
     @staticmethod

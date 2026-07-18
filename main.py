@@ -85,7 +85,7 @@ class MonitorConfig:
     # When True, batch-mode alerts fire on OOS→IN from basicproducts
     # (has_offer) without waiting for a full product() confirm. Seller
     # filtering, if enabled, runs async and only logs (does not retract).
-    fast_alert: bool = True
+    fast_alert: bool = False
 
 
 class AlertState:
@@ -242,8 +242,9 @@ def load_monitor_config(env=None, webhook_targets=None):
     raw_seller_filter = str(env.get("MONITOR_REQUIRE_AMAZON_SELLER", "true")).strip().lower()
     require_amazon_seller = raw_seller_filter not in ("0", "false", "no", "off")
 
-    # Default on: one TVSS RTT on the critical path (batch → notify).
-    raw_fast = str(env.get("MONITOR_FAST_ALERT", "true")).strip().lower()
+    # Accuracy-first default: seller-qualified full confirmation precedes alerts.
+    # Fast mode remains an explicit speculative, separately labeled signal.
+    raw_fast = str(env.get("MONITOR_FAST_ALERT", "false")).strip().lower()
     fast_alert = raw_fast not in ("0", "false", "no", "off")
 
     return MonitorConfig(
@@ -1222,17 +1223,20 @@ async def run_monitor(config, webhook_targets):
 
 async def main():
     from webhooks import WEBHOOK_TARGETS
+    from durable_runtime import run_durable_monitor
 
     try:
         config = load_monitor_config(webhook_targets=WEBHOOK_TARGETS)
     except MonitorConfigError as exc:
         logging.error("Configuration error: %s", exc)
-        return
+        return 2
 
     try:
-        await run_monitor(config, WEBHOOK_TARGETS)
-    except MonitorConfigError as exc:
+        await run_durable_monitor(config, WEBHOOK_TARGETS)
+    except (MonitorConfigError, TVSSConfigError) as exc:
         logging.error("Configuration error: %s", exc)
+        return 2
+    return 0
 
 
 async def login(domain="amazon.com"):
@@ -1254,8 +1258,21 @@ if __name__ == "__main__":
             asyncio.run(login(domain))
         except KeyboardInterrupt:
             print()
+    elif args and args[0] == "alerts":
+        from durable_runtime import run_alert_admin
+
+        action = args[1] if len(args) > 1 else "list"
+        delivery_id = args[2] if len(args) > 2 else None
+        try:
+            raise SystemExit(
+                asyncio.run(
+                    run_alert_admin(action, delivery_id=delivery_id)
+                )
+            )
+        except KeyboardInterrupt:
+            logging.info("Alert administration interrupted")
     else:
         try:
-            asyncio.run(main())
+            raise SystemExit(asyncio.run(main()))
         except KeyboardInterrupt:
             logging.info("Program terminated by user")
