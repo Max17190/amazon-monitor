@@ -23,7 +23,7 @@ Fast Amazon restock monitor that polls Amazon's TVSS API and sends alerts the mo
 
 - Polls configured Amazon ASINs on a loop
 - Sends alerts only on out-of-stock to in-stock transitions
-- Sends alerts directly to Discord, or to Slack and other tools through a generic webhook endpoint
+- Sends alerts directly to Discord or to a generic webhook endpoint
 - Can monitor multiple groups of ASINs with different webhook targets
 - Uses Amazon's TVSS endpoint instead of browser automation or HTML scraping
 - Supports Amazon-seller filtering on the confirmed path
@@ -31,9 +31,10 @@ Fast Amazon restock monitor that polls Amazon's TVSS API and sends alerts the mo
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.11
 - `pip`
 - An Amazon account for TVSS authentication
+- PostgreSQL 14 or newer
 - At least one webhook destination
 
 ## Quick Start (Docker)
@@ -120,13 +121,17 @@ TVSS_MARKETPLACE_ID=ATVPDKIKX0DER
 TVSS_DOMAIN=amazon.com
 TVSS_CURRENCY=USD
 
+DATABASE_URL=postgresql://monitor:monitor@localhost:5432/amazon_monitor
+MONITOR_ID=primary-us
+TVSS_CREDENTIAL_ID=primary-amazon-account
+
 POLL_INTERVAL_SECONDS=5.0
 MONITOR_REQUIRE_AMAZON_SELLER=true
 MONITOR_USE_BATCH=true
 LOG_LEVEL=INFO
 ```
 
-That is the simplest Discord setup. If you want to forward alerts into Slack, a private app, or an automation platform, point a second target at your own webhook consumer:
+That is the simplest Discord setup. To forward alerts into a private app or an automation platform, point a second target at your own webhook consumer:
 
 ```env
 MONITOR_CONFIG_JSON={"groups":[{"name":"NVIDIA GPUs","asins":["B0DT7L98J1"],"webhooks":["DISCORD","AUTOMATION"]}]}
@@ -249,28 +254,61 @@ Common marketplace values:
 POLL_INTERVAL_SECONDS=5.0
 TVSS_CONCURRENCY=20
 TVSS_TIMEOUT=5
-TVSS_429_COOLDOWN_SECONDS=90
+TVSS_429_COOLDOWN_SECONDS=900
+TVSS_MAX_INTERVAL_SECONDS=300
+TVSS_RECOVERY_SUCCESS_COUNT=120
 AUTH_FAILURE_GRACE_SECONDS=30
 MONITOR_REQUIRE_AMAZON_SELLER=true
-MONITOR_FAST_ALERT=true
+MONITOR_FAST_ALERT=false
 MONITOR_USE_BATCH=true
+DATABASE_URL=postgresql://monitor:monitor@localhost:5432/amazon_monitor
+MONITOR_ID=primary-us
+TVSS_CREDENTIAL_ID=primary-amazon-account
+ALERT_WORKER_CONCURRENCY=32
+ALERT_TARGET_CONCURRENCY=2
+ALERT_MAX_ATTEMPTS=10
+ALERT_MAX_AGE_SECONDS=900
+METRICS_PORT=9090
 LOG_LEVEL=INFO
 ```
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `POLL_INTERVAL_SECONDS` | `5.0` | Credential-wide request-start cadence. Minimum `0.5`. The next deadline is measured from request start, not response completion. |
+| `DATABASE_URL` | required | Shared Postgres authority for leases, stock state, transitions, and alert delivery. |
+| `MONITOR_ID` | required | Stable deployment identity used in stock-state scope keys. |
+| `TVSS_CREDENTIAL_ID` | device identity | Stable non-secret identity for one Amazon credential budget. |
+| `POLL_INTERVAL_SECONDS` | `5.0` | Credential-wide request-start cadence. Production rejects values below `5.0`; calibration mode is the only exception. |
 | `TVSS_CONCURRENCY` | `20` | Per-ASIN-mode semaphore (only used when `MONITOR_USE_BATCH=false`). Ignored in batch mode. |
 | `TVSS_TIMEOUT` | `5` | TVSS request timeout in seconds. |
-| `TVSS_429_COOLDOWN_SECONDS` | `90` | Minimum credential-wide cooldown after HTTP 429. `Retry-After` is honored when longer. |
+| `TVSS_429_COOLDOWN_SECONDS` | `900` | Minimum credential-wide cooldown after HTTP 429. `Retry-After` is honored when longer. |
+| `TVSS_MAX_COOLDOWN_SECONDS` | `3600` | Maximum exponentially increased credential cooldown. |
+| `TVSS_MAX_INTERVAL_SECONDS` | `300` | Maximum adaptive request interval after repeated rate limits. |
+| `TVSS_RECOVERY_SUCCESS_COUNT` | `120` | Clean batch polls required before reducing an adaptive interval. |
+| `TVSS_INTERVAL_DECREMENT` | `0.25` | Interval reduction in seconds after a complete clean recovery window. |
+| `TVSS_LEADER_LEASE_SECONDS` | `30` | Credential poll-leader lease lifetime. |
+| `TVSS_LEADER_RENEW_SECONDS` | `10` | Credential lease renewal cadence. |
 | `AUTH_FAILURE_GRACE_SECONDS` | `30` | How long auth failures can persist without a successful poll before the monitor sends an auth-expiry alert and exits with code `1`. |
-| `MONITOR_REQUIRE_AMAZON_SELLER` | `true` | Prefer Amazon-sold offers. With `MONITOR_FAST_ALERT=true`, seller is checked asynchronously after the alert. |
-| `MONITOR_FAST_ALERT` | `true` | If `true`, alert on batch OOS to in-stock as soon as an offer appears (one TVSS round trip on the critical path). Set `false` to wait for a full `product()` confirm before notifying. |
+| `MONITOR_REQUIRE_AMAZON_SELLER` | `true` | Require a full seller-qualified product confirmation before a confirmed alert. |
+| `MONITOR_FAST_ALERT` | `false` | Opt-in speculative `offer_detected` delivery. Speculative alerts are labeled unconfirmed and use a separate deduplication identity. |
 | `MONITOR_USE_BATCH` | `true` | If `true`, poll one `basicproducts` batch containing at most 20 ASINs. |
+| `ALERT_WORKER_CONCURRENCY` | `32` | Global durable delivery worker concurrency. |
+| `ALERT_TARGET_CONCURRENCY` | `2` | Per-target delivery concurrency. |
+| `ALERT_MAX_ATTEMPTS` | `10` | Maximum attempts before a target delivery is dead-lettered. |
+| `ALERT_MAX_AGE_SECONDS` | `900` | Maximum delivery retry age. |
+| `ALERT_MAX_BACKOFF_SECONDS` | `60` | Maximum decorrelated retry delay. |
+| `ALERT_CONNECT_TIMEOUT_SECONDS` | `1` | Per-attempt webhook connect timeout. |
+| `ALERT_READ_TIMEOUT_SECONDS` | `2` | Per-attempt webhook read timeout. |
+| `ALERT_ATTEMPT_TIMEOUT_SECONDS` | `3` | Total webhook attempt deadline. |
+| `ALERT_CIRCUIT_FAILURE_THRESHOLD` | `5` | Consecutive transient target failures before opening its circuit. |
+| `ALERT_CIRCUIT_OPEN_SECONDS` | `60` | Target circuit open duration. |
+| `ALERT_DEAD_LETTER_RETENTION_DAYS` | `30` | Dead-letter audit retention before cleanup. |
+| `STOCK_CONFIRM_TTL_SECONDS` | `30` | Maximum age for a full-product confirmation job. |
+| `STOCK_OOS_REARM_COUNT` | `2` | Strong, cadence-separated out-of-stock observations required to rearm. Values below two are rejected. |
+| `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics. |
 | `PROXY_URL` | unset | Optional HTTP proxy URL. Credentials are never logged. |
 | `PROXY_URLS_JSON` | unset | JSON array of proxy URLs or `host:port:user:password` entries, suitable for a Railway secret. |
 | `PROXY_POOL_FILE` | unset | Ignored local proxy file with one URL or Webshare entry per line. |
-| `PROXY_MODE` | `fallback` | `fallback`: direct first, one ranked alternate on network failure, and a half-open proxy probe after 429 cooldown. `always`: proxy first. |
+| `PROXY_MODE` | `fallback` | `fallback`: direct first, then a ranked alternate only on network failure. HTTP 429 never rotates proxies. `always`: proxy first. |
 | `LOG_LEVEL` | `INFO` | `INFO` or `DEBUG`. Per-poll status lines are at `DEBUG`. |
 
 Each successful batch emits a structured `tvss_stage` record with request wall
@@ -301,7 +339,8 @@ The bounded `us-east4-eqdc4a` canary selected a 5-second cadence. Its final
 
 Notes:
 
-- Fast-alert is the default critical path (`MONITOR_FAST_ALERT=true`).
+- Confirmed seller-qualified alerts are the default.
+- `MONITOR_FAST_ALERT=true` is an explicit speculative path.
 - Average end-to-end restock timing also depends on poll interval (often about half the interval, plus the detect path).
 - External webhooks (for example Discord) add their own delivery time.
 - Routing TVSS through a residential proxy increases detect-path latency substantially; keep proxies as `PROXY_MODE=fallback` for reliability, not for best latency.
@@ -407,12 +446,36 @@ python main.py
 
 Useful behavior to know:
 
-- The first observation of an ASIN is treated as priming and does not alert
-- Alerts are sent only on out-of-stock to in-stock transitions
-- With fast-alert (default), a newly seen batch offer triggers the webhook immediately; Amazon-seller confirm can still run in the background and does not block the alert
-- With `MONITOR_FAST_ALERT=false`, the monitor waits for a full product confirm before notifying
-- If webhook delivery fails for every target, the transition is not committed and will be retried on a later poll
+- The first durable observation of an ASIN is treated as priming and does not alert
+- A new epoch is armed only after two strong out-of-stock observations separated by one poll interval
+- Missing, malformed, contradictory, and partial responses do not change stock state
+- Confirmed alerts require a buyable full-product response and the configured seller policy
+- A transition and all target deliveries are committed atomically before delivery begins
+- Every target retries independently for up to 15 minutes, then dead-letters without reopening the stock transition
+- Restarts resume pending deliveries and preserve rate-limit cooldowns
 - If TVSS auth expires and the grace window is exceeded, the monitor sends an auth-expiry alert and exits non-zero so your platform can restart it
+
+### Delivery operations
+
+The operations server exposes:
+
+- `GET /health/live`
+- `GET /health/ready`
+- `GET /metrics`
+
+Dead-lettered target deliveries can be inspected and controlled without
+reopening the stock transition:
+
+```sh
+python main.py alerts list
+python main.py alerts replay DELIVERY_UUID
+python main.py alerts suppress DELIVERY_UUID
+```
+
+Generic webhooks receive stable `Idempotency-Key`, `X-Alert-Id`, and
+`X-Alert-Delivery-Id` headers. The JSON body preserves the original product
+fields and adds transition identity, stock epoch, confirmation state, matching
+groups, and detection and persistence timestamps.
 
 ## Docker / Railway
 
@@ -551,7 +614,8 @@ LOG_LEVEL=DEBUG
 Stop authenticated tests and let the credential cool down. Run
 `python cadence_canary.py --confirm` after the quiet period. The monitor honors
 `Retry-After`, blocks every TVSS request during the credential-wide cooldown,
-and permits one half-open probe through the best healthy fallback proxy.
+and permits one half-open batch poll after the persisted cooldown. HTTP 429
+never changes the active proxy route.
 
 ### `HTTP 400` from TVSS
 

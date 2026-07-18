@@ -230,7 +230,7 @@ class MonitorConfigTests(unittest.TestCase):
             config = load_monitor_config(env=env, webhook_targets=targets)
             self.assertFalse(config.require_amazon_seller, f"value {raw!r} should parse falsy")
 
-    def test_fast_alert_default_true(self):
+    def test_fast_alert_default_false(self):
         targets = {
             "PRIMARY": WebhookTarget(name="PRIMARY", url="https://x/y"),
         }
@@ -238,22 +238,22 @@ class MonitorConfigTests(unittest.TestCase):
             "MONITOR_CONFIG_JSON": json.dumps(
                 {"groups": [{"name": "G", "asins": ["B0DT7L98J1"], "webhooks": ["PRIMARY"]}]}
             ),
-        }
-        config = load_monitor_config(env=env, webhook_targets=targets)
-        self.assertTrue(config.fast_alert)
-
-    def test_fast_alert_can_be_disabled(self):
-        targets = {
-            "PRIMARY": WebhookTarget(name="PRIMARY", url="https://x/y"),
-        }
-        env = {
-            "MONITOR_CONFIG_JSON": json.dumps(
-                {"groups": [{"name": "G", "asins": ["B0DT7L98J1"], "webhooks": ["PRIMARY"]}]}
-            ),
-            "MONITOR_FAST_ALERT": "false",
         }
         config = load_monitor_config(env=env, webhook_targets=targets)
         self.assertFalse(config.fast_alert)
+
+    def test_fast_alert_can_be_enabled_explicitly(self):
+        targets = {
+            "PRIMARY": WebhookTarget(name="PRIMARY", url="https://x/y"),
+        }
+        env = {
+            "MONITOR_CONFIG_JSON": json.dumps(
+                {"groups": [{"name": "G", "asins": ["B0DT7L98J1"], "webhooks": ["PRIMARY"]}]}
+            ),
+            "MONITOR_FAST_ALERT": "true",
+        }
+        config = load_monitor_config(env=env, webhook_targets=targets)
+        self.assertTrue(config.fast_alert)
 
     def test_product_from_batch_builds_minimal_payload(self):
         from main import product_from_batch
@@ -533,6 +533,22 @@ class TVSSClientTests(unittest.TestCase):
         self.assertEqual(product["images"], [])
         self.assertIsNone(product["price"])
         self.assertEqual(product["availability"], {})
+        self.assertFalse(product["response_complete"])
+
+    def test_parse_product_rejects_mismatched_or_malformed_identity_fields(self):
+        client = self.make_client()
+        product = client._parse_product(
+            {
+                "asin": "B000000002",
+                "offerId": {"malformed": True},
+                "merchantInfo": "malformed",
+                "productAvailabilityDetails": ["malformed"],
+            },
+            "B000000001",
+        )
+        self.assertEqual(product["asin"], "B000000001")
+        self.assertFalse(product["response_complete"])
+        self.assertFalse(product["in_stock"])
 
 
 class BatchProductsParseTests(unittest.TestCase):
@@ -844,7 +860,12 @@ class FastAlertPayloadTests(unittest.TestCase):
             ),
         )
         embed = AlertDispatcher(session=None).create_embed(product)
-        field_value = embed.fields[0][1]["value"]
+        first_field = embed.fields[0]
+        field_value = (
+            first_field.value
+            if hasattr(first_field, "value")
+            else first_field[1]["value"]
+        )
         self.assertIn("Seller unconfirmed", field_value)
         self.assertNotIn("Sold By:** Amazon.com", field_value)
 

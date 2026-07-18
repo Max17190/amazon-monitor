@@ -1,3 +1,8 @@
 discord.py
 python-dotenv
 aiohttp
+asyncpg>=0.30,<1
+prometheus-client>=0.20,<1
+opentelemetry-api>=1.30,<2
+opentelemetry-sdk>=1.30,<2
+opentelemetry-exporter-otlp>=1.30,<2

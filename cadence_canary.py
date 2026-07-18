@@ -12,6 +12,7 @@ import aiohttp
 from dotenv import load_dotenv
 
 from amazon_tvss import TVSSClient, TVSSConfigError, TVSSRateLimitError
+from durable_runtime import exclusive_canary_lease
 
 
 load_dotenv("endpoint.env")
@@ -123,12 +124,11 @@ async def validate(client, session, asins, interval, observations):
     }
 
 
-async def run(args):
+async def _run_canary(args, client):
     asins = parse_asins(args.asins)
     if not asins:
         raise TVSSConfigError("at least one valid ASIN is required")
 
-    client = TVSSClient()
     connector = aiohttp.TCPConnector(
         limit=0,
         ttl_dns_cache=300,
@@ -223,6 +223,16 @@ async def run(args):
     }
     print(json.dumps({"stage": "summary", **summary}, sort_keys=True))
     return 0 if accepted else 1
+
+
+async def run(args):
+    client = TVSSClient()
+    async with exclusive_canary_lease(
+        client,
+        base_interval=min(INTERVALS),
+        calibration=True,
+    ):
+        return await _run_canary(args, client)
 
 
 def main():

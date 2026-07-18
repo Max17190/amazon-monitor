@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 
 from amazon_tvss import TVSSClient
 from cadence_canary import MAX_P50_MS, parse_asins, validate
+from durable_runtime import exclusive_canary_lease
 
 
 load_dotenv("endpoint.env")
@@ -39,14 +40,19 @@ async def run(args):
         ttl_dns_cache=300,
         keepalive_timeout=120,
     )
-    async with aiohttp.ClientSession(connector=connector) as session:
-        result = await validate(
-            client,
-            session,
-            asins,
-            args.interval,
-            args.observations,
-        )
+    async with exclusive_canary_lease(
+        client,
+        base_interval=args.interval,
+        calibration=True,
+    ):
+        async with aiohttp.ClientSession(connector=connector) as session:
+            result = await validate(
+                client,
+                session,
+                asins,
+                args.interval,
+                args.observations,
+            )
 
     accepted = (
         result["outcome"] == "clean"

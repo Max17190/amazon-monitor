@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 load_dotenv("endpoint.env")
 
 from amazon_tvss import TVSSClient  # noqa: E402
+from durable_runtime import exclusive_canary_lease  # noqa: E402
 from main import AlertDispatcher, AlertState, product_from_batch  # noqa: E402
 from webhooks import WebhookTarget  # noqa: E402
 
@@ -195,7 +196,7 @@ async def pick_in_stock_asin(client, session, candidates):
     return None, None
 
 
-async def run_probe():
+async def _run_probe(client):
     global receipt_event
 
     raw = os.getenv("LATENCY_ASINS", "").strip()
@@ -205,7 +206,6 @@ async def run_probe():
 
     httpd = start_server()
     loop = asyncio.get_running_loop()
-    client = TVSSClient()
     client.configure_rate_controller(SPACING)
     connector = aiohttp.TCPConnector(
         limit=0,
@@ -440,6 +440,16 @@ async def run_probe():
 
     httpd.shutdown()
     return 0
+
+
+async def run_probe():
+    client = TVSSClient()
+    async with exclusive_canary_lease(
+        client,
+        base_interval=SPACING,
+        calibration=True,
+    ):
+        return await _run_probe(client)
 
 
 def main():

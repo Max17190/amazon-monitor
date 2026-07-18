@@ -1,10 +1,32 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: amazon_monitor
+      POSTGRES_USER: monitor
+      POSTGRES_PASSWORD: monitor
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monitor -d amazon_monitor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - monitor-postgres:/var/lib/postgresql/data
+
   monitor:
     build: .
     env_file: ./endpoint.env
+    environment:
+      DATABASE_URL: postgresql://monitor:monitor@postgres:5432/amazon_monitor
+    depends_on:
+      postgres:
+        condition: service_healthy
     volumes:
       - ./auth.json:/app/auth.json
       - ./endpoint.env:/app/endpoint.env:ro
     restart: unless-stopped
     command: python main.py
     stop_grace_period: 30s
+
+volumes:
+  monitor-postgres:
