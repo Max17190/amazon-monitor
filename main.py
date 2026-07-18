@@ -703,7 +703,10 @@ async def _handle_transition(
                 product.get("seller") or "unknown",
             )
             async with state_lock:
-                state.commit(asin, False)
+                # AlertState tracks the batch buyable-offer signal. Remember
+                # this offer even though seller policy suppressed the alert,
+                # otherwise every batch poll schedules another full fetch.
+                state.commit(asin, True)
             return
 
         if not in_stock:
@@ -1050,8 +1053,7 @@ async def run_monitor(config, webhook_targets):
         raise MonitorConfigError(
             f"batch monitor supports at most {TVSS_MONITOR_ASIN_CAP} ASINs"
         )
-    if use_batch:
-        tvss_client.configure_rate_controller(config.poll_interval_seconds)
+    tvss_client.configure_rate_controller(config.poll_interval_seconds)
     # Map ASIN → first group it belongs to (for group_name in alerts)
     asin_to_group = {}
     asin_to_targets = {}

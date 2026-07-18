@@ -5,7 +5,7 @@ import os
 import sys
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import aiohttp
 
@@ -76,10 +76,12 @@ from main import (
     JITTER_FRACTION,
     MAX_BATCH_CONCURRENCY,
     MIN_POLL_INTERVAL_SECONDS,
+    MonitorConfig,
     MonitorConfigError,
     PENALTY_BOX_SLEEP,
     PENALTY_BOX_THRESHOLD,
     TVSS_BATCH_HARD_CAP,
+    _handle_transition,
     build_generic_payload,
     clamp,
     jittered,
@@ -767,6 +769,57 @@ class LatencyFormattingTests(unittest.TestCase):
 
     def test_formats_missing_receipt_as_timeout(self):
         self.assertEqual(format_path_latency(None), "timeout")
+
+
+class SellerFilterTransitionTests(unittest.TestCase):
+    def test_filtered_offer_is_remembered_without_repeated_confirmation(self):
+        asin = "B000000001"
+        state = AlertState()
+        state.commit(asin, False)
+        self.assertTrue(
+            state.reserve_transition(asin, ObservationStatus.IN_STOCK)
+        )
+
+        client = types.SimpleNamespace(
+            product=AsyncMock(
+                return_value={
+                    "asin": asin,
+                    "in_stock": True,
+                    "soldByAmazon": False,
+                    "seller": "Third Party",
+                }
+            )
+        )
+        dispatcher = types.SimpleNamespace(
+            send_notification=AsyncMock(return_value=True)
+        )
+        config = MonitorConfig(
+            poll_interval_seconds=5.0,
+            groups=[],
+            require_amazon_seller=True,
+            fast_alert=False,
+        )
+
+        asyncio.run(
+            _handle_transition(
+                asin,
+                {},
+                {},
+                client,
+                None,
+                state,
+                asyncio.Lock(),
+                dispatcher,
+                AuthFailureWatch(),
+                asyncio.Semaphore(1),
+                config,
+                asyncio.Event(),
+            )
+        )
+
+        self.assertFalse(state.peek(asin, True))
+        self.assertFalse(state.has_inflight(asin))
+        dispatcher.send_notification.assert_not_awaited()
 
 
 class FastAlertPayloadTests(unittest.TestCase):

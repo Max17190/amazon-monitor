@@ -2,7 +2,21 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from cadence_canary import run_bucket, validate
+from cadence_canary import advance_deadline, run_bucket, validate
+
+
+class DeadlineSchedulingTests(unittest.TestCase):
+    def test_preserves_next_future_deadline(self):
+        self.assertEqual(advance_deadline(10.0, 5.0, now=12.0), 15.0)
+
+    def test_skips_elapsed_slots_without_catch_up_burst(self):
+        self.assertEqual(advance_deadline(10.0, 5.0, now=27.0), 30.0)
+
+    def test_allows_a_deadline_at_the_current_time(self):
+        self.assertEqual(advance_deadline(10.0, 5.0, now=15.0), 15.0)
+
+    def test_zero_interval_uses_current_time(self):
+        self.assertEqual(advance_deadline(10.0, 0.0, now=12.0), 12.0)
 
 
 class FirstRateLimitStopsTests(unittest.TestCase):

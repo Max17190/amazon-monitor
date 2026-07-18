@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import json
+import math
 import os
 import time
 
@@ -44,6 +45,19 @@ async def sleep_until(deadline):
         await asyncio.sleep(delay)
 
 
+def advance_deadline(previous_deadline, interval, now=None):
+    now = time.perf_counter() if now is None else float(now)
+    interval = float(interval)
+    if interval <= 0:
+        return now
+
+    next_deadline = previous_deadline + interval
+    if next_deadline < now:
+        elapsed_slots = math.ceil((now - next_deadline) / interval)
+        next_deadline += elapsed_slots * interval
+    return next_deadline
+
+
 async def probe_once(client, session, asins):
     started = time.perf_counter()
     try:
@@ -72,7 +86,7 @@ async def run_bucket(client, session, asins, interval, duration):
             outcome = "error"
             break
         latencies.append(latency_ms)
-        next_start += interval
+        next_start = advance_deadline(next_start, interval)
 
     return {
         "interval_seconds": interval,
@@ -98,7 +112,7 @@ async def validate(client, session, asins, interval, observations):
                 "p95_ms": percentile(latencies, 95) if latencies else None,
             }
         latencies.append(latency_ms)
-        next_start += interval
+        next_start = advance_deadline(next_start, interval)
 
     return {
         "interval_seconds": interval,
