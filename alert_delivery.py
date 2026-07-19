@@ -116,6 +116,9 @@ class OutboxRepository(Protocol):
         self, delivery_id: str, *, attempts: int, error_class: ErrorClass, status_code: int | None,
         detail: str | None, duration_seconds: float,
     ) -> None: ...
+    async def release_preleases(
+        self, delivery_ids: Iterable[str],
+    ) -> None: ...
 
 
 class DeliverySender(Protocol):
@@ -417,6 +420,22 @@ class AlertDeliveryWorker:
             self._claim_supports_preferred_ids = False
         return self._claim_supports_preferred_ids
 
+    async def _release_preleases(
+        self,
+        deliveries: Iterable[AlertDelivery],
+    ) -> None:
+        delivery_ids = tuple(
+            str(delivery.delivery_id) for delivery in deliveries
+        )
+        if not delivery_ids:
+            return
+        release = getattr(self.repository, "release_preleases", None)
+        if release is None:
+            self.wakeup.wake_preleased(deliveries)
+            return
+        release_task = asyncio.create_task(release(delivery_ids))
+        await asyncio.shield(release_task)
+
     async def _claim_due(
         self,
         *,
@@ -491,24 +510,35 @@ class AlertDeliveryWorker:
                 queued_preleased.difference_update(
                     str(delivery.delivery_id) for delivery in claimed
                 )
-                outcomes = await asyncio.gather(
-                    *(self._deliver(delivery) for delivery in claimed),
-                    return_exceptions=True,
-                )
+                try:
+                    outcomes = await asyncio.gather(
+                        *(self._deliver(delivery) for delivery in claimed),
+                        return_exceptions=True,
+                    )
+                except asyncio.CancelledError:
+                    await self._release_preleases(
+                        (*claimed, *pending_preleased)
+                    )
+                    raise
                 failed = tuple(
                     delivery
                     for delivery, outcome in zip(claimed, outcomes)
                     if isinstance(outcome, BaseException)
                 )
                 if failed:
-                    self.wakeup.wake_preleased(
-                        (*failed, *pending_preleased)
-                    )
                     first_error = next(
                         outcome
                         for outcome in outcomes
                         if isinstance(outcome, BaseException)
                     )
+                    if isinstance(first_error, asyncio.CancelledError):
+                        await self._release_preleases(
+                            (*failed, *pending_preleased)
+                        )
+                    else:
+                        self.wakeup.wake_preleased(
+                            (*failed, *pending_preleased)
+                        )
                     raise first_error
                 total += len(claimed)
                 continue

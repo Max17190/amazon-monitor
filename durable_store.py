@@ -1387,6 +1387,41 @@ class PostgresStore:
                     )
                     await self._refresh_alert_lifecycle(connection, row["alert_id"])
 
+    async def release_preleased_deliveries(
+        self,
+        worker_id,
+        delivery_ids,
+    ):
+        delivery_ids = tuple(delivery_ids)
+        if not delivery_ids:
+            return ()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    UPDATE alert_deliveries
+                    SET status = 'pending',
+                        leased_by = NULL,
+                        leased_until = NULL,
+                        next_attempt_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE delivery_id = ANY($1::uuid[])
+                      AND status = 'leased'
+                      AND leased_by = $2
+                      AND attempts = 0
+                    RETURNING delivery_id
+                    """,
+                    [UUID(value) for value in delivery_ids],
+                    str(worker_id),
+                )
+                released = tuple(row["delivery_id"] for row in rows)
+                if released:
+                    await connection.execute(
+                        "SELECT pg_notify('alert_outbox_ready', $1)",
+                        _outbox_notification_payload(released),
+                    )
+        return released
+
     async def reschedule_delivery(
         self,
         delivery_id,

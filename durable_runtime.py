@@ -323,6 +323,12 @@ class PostgresOutboxRepository:
             attempts=attempts,
         )
 
+    async def release_preleases(self, delivery_ids):
+        await self.store.release_preleased_deliveries(
+            self.worker_id,
+            delivery_ids,
+        )
+
 
 class DurableDeliverySender:
     """Deliver generic JSON or Discord embeds from the same durable row."""

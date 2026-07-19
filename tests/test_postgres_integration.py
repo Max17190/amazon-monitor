@@ -366,6 +366,44 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["attempts"], 0)
         self.assertIsNone(row["leased_by"])
 
+    async def test_cancelled_prelease_is_released_for_immediate_claim(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes(targets=("cancelled",))
+        result = await self.store.commit_stock_decisions(
+            (
+                BatchStockDecision(
+                    scope,
+                    self.state(),
+                    None,
+                    {"offer_id": "offer"},
+                    transition,
+                    alert,
+                    targets,
+                ),
+            ),
+            prelease_worker_id="cancelled-worker",
+            prelease_global_limit=1,
+            prelease_per_target_limit=1,
+        )
+        released = await self.store.release_preleased_deliveries(
+            "cancelled-worker",
+            [str(result.preleased_delivery_ids[0])],
+        )
+        self.assertEqual(released, result.preleased_delivery_ids)
+        recovered = await self.store.claim_deliveries(
+            "recovery-worker",
+            limit=1,
+            lease_seconds=30,
+            global_limit=1,
+            per_target_limit=1,
+        )
+        self.assertEqual(
+            [row["delivery_id"] for row in recovered],
+            [targets[0].delivery_id],
+        )
+        self.assertEqual(recovered[0]["attempts"], 1)
+        self.assertEqual(recovered[0]["leased_by"], "recovery-worker")
+
     async def test_prelease_respects_open_target_circuit(self):
         scope = ScopeKey("monitor", "market", "B000000001", "policy")
         transition, alert, targets = self.writes(targets=("open-target",))

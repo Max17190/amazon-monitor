@@ -451,6 +451,46 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             {"preleased-0", "preleased-2", "preleased-3"},
         )
 
+    async def test_cancelled_prelease_drain_releases_all_outstanding_rows(self):
+        class ReleasingOutbox(EmptyOutbox):
+            def __init__(self):
+                super().__init__([])
+                self.released = ()
+
+            async def release_preleases(self, delivery_ids):
+                self.released = tuple(delivery_ids)
+
+        class BlockingSender:
+            def __init__(self):
+                self.started = asyncio.Event()
+
+            async def send(self, _delivery):
+                self.started.set()
+                await asyncio.Event().wait()
+
+        repository = ReleasingOutbox()
+        sender = BlockingSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=1,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id=f"target-{index}")
+            for index in range(3)
+        )
+        task = asyncio.create_task(worker._drain(preleased=deliveries))
+        await asyncio.wait_for(sender.started.wait(), timeout=0.2)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(
+            repository.released,
+            ("preleased-0", "preleased-1", "preleased-2"),
+        )
+
 
 class WakeupTests(unittest.IsolatedAsyncioTestCase):
     async def test_wakeup_coalesces_ids_and_notification_payloads(self):
