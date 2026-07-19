@@ -105,6 +105,7 @@ class OutboxRepository(Protocol):
     async def succeed(
         self, delivery_id: str, *, delivered_at: float,
         status_code: int | None, duration_seconds: float,
+        attempts: int,
     ) -> None: ...
     async def retry(
         self, delivery_id: str, *, attempts: int, next_attempt_at: float, error_class: ErrorClass,
@@ -490,9 +491,25 @@ class AlertDeliveryWorker:
                 queued_preleased.difference_update(
                     str(delivery.delivery_id) for delivery in claimed
                 )
-                await asyncio.gather(
-                    *(self._deliver(delivery) for delivery in claimed)
+                outcomes = await asyncio.gather(
+                    *(self._deliver(delivery) for delivery in claimed),
+                    return_exceptions=True,
                 )
+                failed = tuple(
+                    delivery
+                    for delivery, outcome in zip(claimed, outcomes)
+                    if isinstance(outcome, BaseException)
+                )
+                if failed:
+                    self.wakeup.wake_preleased(
+                        (*failed, *pending_preleased)
+                    )
+                    first_error = next(
+                        outcome
+                        for outcome in outcomes
+                        if isinstance(outcome, BaseException)
+                    )
+                    raise first_error
                 total += len(claimed)
                 continue
             # Commits can arrive while a prior batch is delivered. Merge them
@@ -634,6 +651,7 @@ class AlertDeliveryWorker:
                 delivered_at=self.clock(),
                 status_code=attempt.status_code,
                 duration_seconds=duration_seconds,
+                attempts=delivery.attempts + 1,
             )
             self.metrics.increment("alert_delivery_total", labels={**labels, "outcome": "success"})
             self.metrics.observe(

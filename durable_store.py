@@ -472,23 +472,8 @@ class PostgresStore:
                     "evidence": _jsonable(verification.evidence),
                     "ttl_seconds": verification.ttl_seconds,
                 })
-        global_prelease_limit = int(prelease_global_limit)
-        target_prelease_limit = int(prelease_per_target_limit)
-        remaining_preleases = (
-            global_prelease_limit if prelease_worker_id is not None else 0
-        )
-        preleases_by_target = {}
         for row in delivery_rows:
-            target_id = row["target_id"]
-            target_count = preleases_by_target.get(target_id, 0)
-            selected = (
-                remaining_preleases > 0
-                and target_count < target_prelease_limit
-            )
-            row["prelease"] = selected
-            if selected:
-                remaining_preleases -= 1
-                preleases_by_target[target_id] = target_count + 1
+            row["prelease"] = False
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 if lease_credential_key is not None or lease_owner is not None:
@@ -510,6 +495,53 @@ class PostgresStore:
                         raise CredentialLeaseFenceLost(
                             "TVSS credential leader lease is no longer held"
                         )
+                if prelease_worker_id is not None and delivery_rows:
+                    active_rows = await connection.fetch(
+                        """
+                        WITH delivery_claim_lock AS MATERIALIZED (
+                            SELECT pg_advisory_xact_lock($1::bigint)
+                        )
+                        SELECT delivery.target_id, COUNT(*)::integer AS count
+                        FROM alert_deliveries AS delivery,
+                            delivery_claim_lock
+                        WHERE delivery.status = 'leased'
+                          AND delivery.leased_until > clock_timestamp()
+                        GROUP BY delivery.target_id
+                        """,
+                        DELIVERY_CLAIM_LOCK_ID,
+                    )
+                    active_by_target = {
+                        row["target_id"]: int(row["count"])
+                        for row in active_rows
+                    }
+                    remaining_preleases = max(
+                        0,
+                        int(prelease_global_limit)
+                        - sum(active_by_target.values()),
+                    )
+                    target_prelease_limit = int(
+                        prelease_per_target_limit
+                    )
+                    selected_by_target = {}
+                    for row in delivery_rows:
+                        target_id = row["target_id"]
+                        selected_count = selected_by_target.get(
+                            target_id, 0
+                        )
+                        selected = (
+                            remaining_preleases > 0
+                            and (
+                                active_by_target.get(target_id, 0)
+                                + selected_count
+                                < target_prelease_limit
+                            )
+                        )
+                        row["prelease"] = selected
+                        if selected:
+                            remaining_preleases -= 1
+                            selected_by_target[target_id] = (
+                                selected_count + 1
+                            )
                 result = await connection.fetchrow(
                     """
                     WITH state_input AS (
@@ -612,18 +644,15 @@ class PostgresStore:
                         delivery_input.payload_version,
                         CASE WHEN NOT prelease.selected
                             THEN 'pending' ELSE 'leased' END,
-                        CASE WHEN NOT prelease.selected
-                            THEN 0 ELSE 1 END,
+                        0,
                         CASE WHEN NOT prelease.selected
                             THEN NULL ELSE $7::text END,
                         CASE WHEN NOT prelease.selected
                             THEN NULL ELSE clock_timestamp()
                                 + ($8::double precision
                                    * INTERVAL '1 second') END,
-                        CASE WHEN NOT prelease.selected
-                            THEN NULL ELSE clock_timestamp() END,
-                        CASE WHEN NOT prelease.selected
-                            THEN NULL ELSE clock_timestamp() END
+                        NULL,
+                        NULL
                     FROM delivery_input JOIN inserted_alerts
                         ON inserted_alerts.alert_id = delivery_input.alert_id
                     LEFT JOIN alert_target_circuits AS circuit
@@ -1306,6 +1335,7 @@ class PostgresStore:
         delivery_id,
         duration_ms,
         remote_request_id=None,
+        attempts=None,
     ):
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -1317,6 +1347,13 @@ class PostgresStore:
                         leased_until = NULL,
                         delivered_at = clock_timestamp(),
                         remote_request_id = $2,
+                        attempts = GREATEST(
+                            attempts, COALESCE($3::integer, attempts)
+                        ),
+                        first_attempt_at = COALESCE(
+                            first_attempt_at, clock_timestamp()
+                        ),
+                        last_attempt_at = clock_timestamp(),
                         last_error_class = NULL,
                         last_http_status = NULL,
                         updated_at = clock_timestamp()
@@ -1325,6 +1362,7 @@ class PostgresStore:
                     """,
                     delivery_id,
                     remote_request_id,
+                    attempts,
                 )
                 if row:
                     await connection.execute(
@@ -1360,6 +1398,7 @@ class PostgresStore:
         previous_backoff_seconds=None,
         circuit_failure_threshold=5,
         circuit_open_seconds=60.0,
+        attempts=None,
     ):
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -1370,6 +1409,13 @@ class PostgresStore:
                         next_attempt_at = clock_timestamp()
                             + ($2::double precision * INTERVAL '1 second'),
                         previous_backoff_seconds = $3,
+                        attempts = GREATEST(
+                            attempts, COALESCE($6::integer, attempts)
+                        ),
+                        first_attempt_at = COALESCE(
+                            first_attempt_at, clock_timestamp()
+                        ),
+                        last_attempt_at = clock_timestamp(),
                         leased_by = NULL,
                         leased_until = NULL,
                         last_error_class = $4,
@@ -1383,6 +1429,7 @@ class PostgresStore:
                     previous_backoff_seconds,
                     error_class,
                     http_status,
+                    attempts,
                 )
                 if row:
                     await connection.execute(
@@ -1436,6 +1483,7 @@ class PostgresStore:
         error_class=None,
         http_status=None,
         retention_days=30,
+        attempts=None,
     ):
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -1445,6 +1493,14 @@ class PostgresStore:
                     SET status = 'dead_lettered',
                         leased_by = NULL,
                         leased_until = NULL,
+                        attempts = GREATEST(
+                            delivery.attempts,
+                            COALESCE($4::integer, delivery.attempts)
+                        ),
+                        first_attempt_at = COALESCE(
+                            delivery.first_attempt_at, clock_timestamp()
+                        ),
+                        last_attempt_at = clock_timestamp(),
                         last_error_class = $2,
                         last_http_status = $3,
                         updated_at = clock_timestamp()
@@ -1460,6 +1516,7 @@ class PostgresStore:
                     delivery_id,
                     error_class,
                     http_status,
+                    attempts,
                 )
                 if not row:
                     return

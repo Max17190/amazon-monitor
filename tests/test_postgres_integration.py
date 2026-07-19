@@ -253,7 +253,8 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         async with self.store.pool.acquire() as connection:
             rows = await connection.fetch(
                 """
-                SELECT delivery_id, target_id, status, attempts, leased_by
+                SELECT delivery_id, target_id, status, attempts, leased_by,
+                       first_attempt_at, last_attempt_at
                 FROM alert_deliveries
                 ORDER BY target_id, delivery_id
                 """
@@ -268,13 +269,102 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending[0]["target_id"], "same")
         self.assertTrue(
             all(
-                row["attempts"] == 1
+                row["attempts"] == 0
                 and row["leased_by"] == "commit-worker"
+                and row["first_attempt_at"] is None
+                and row["last_attempt_at"] is None
                 for row in leased
             )
         )
         self.assertEqual(pending[0]["attempts"], 0)
         self.assertIsNone(pending[0]["leased_by"])
+        await self.store.mark_delivery_succeeded(
+            leased[0]["delivery_id"],
+            duration_ms=1,
+            attempts=1,
+        )
+        async with self.store.pool.acquire() as connection:
+            completed = await connection.fetchrow(
+                """
+                SELECT status, attempts, first_attempt_at, last_attempt_at
+                FROM alert_deliveries
+                WHERE delivery_id = $1
+                """,
+                leased[0]["delivery_id"],
+            )
+        self.assertEqual(completed["status"], "succeeded")
+        self.assertEqual(completed["attempts"], 1)
+        self.assertIsNotNone(completed["first_attempt_at"])
+        self.assertIsNotNone(completed["last_attempt_at"])
+
+    async def test_prelease_respects_existing_shared_capacity(self):
+        first_scope = ScopeKey(
+            "monitor", "market", "B000000001", "policy"
+        )
+        first_transition, first_alert, first_targets = self.writes(
+            targets=("shared",)
+        )
+        first = await self.store.commit_stock_decisions(
+            (
+                BatchStockDecision(
+                    first_scope,
+                    self.state(),
+                    None,
+                    {"offer_id": "first"},
+                    first_transition,
+                    first_alert,
+                    first_targets,
+                ),
+            ),
+            prelease_worker_id="first-worker",
+            prelease_global_limit=1,
+            prelease_per_target_limit=1,
+        )
+        self.assertEqual(
+            first.preleased_delivery_ids,
+            (first_targets[0].delivery_id,),
+        )
+
+        second_scope = ScopeKey(
+            "monitor", "market", "B000000002", "policy"
+        )
+        second_transition, second_alert, second_targets = self.writes(
+            targets=("other",)
+        )
+        second = await self.store.commit_stock_decisions(
+            (
+                BatchStockDecision(
+                    second_scope,
+                    {
+                        **self.state(),
+                        "scope_key": (
+                            "monitor:market:B000000002:policy"
+                        ),
+                    },
+                    None,
+                    {"offer_id": "second"},
+                    second_transition,
+                    second_alert,
+                    second_targets,
+                ),
+            ),
+            prelease_worker_id="second-worker",
+            prelease_global_limit=1,
+            prelease_per_target_limit=1,
+        )
+        self.assertEqual(second.preleased_delivery_ids, ())
+        async with self.store.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT status, attempts, leased_by
+                FROM alert_deliveries
+                WHERE delivery_id = $1
+                """,
+                second_targets[0].delivery_id,
+            )
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 0)
+        self.assertIsNone(row["leased_by"])
 
     async def test_prelease_respects_open_target_circuit(self):
         scope = ScopeKey("monitor", "market", "B000000001", "policy")
@@ -367,7 +457,7 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
             [targets[0].delivery_id],
         )
         self.assertEqual(recovered[0]["leased_by"], "recovery-worker")
-        self.assertEqual(recovered[0]["attempts"], 2)
+        self.assertEqual(recovered[0]["attempts"], 1)
 
     async def test_batch_commit_notifies_only_after_delivery_commit(self):
         scope = ScopeKey("monitor", "market", "B000000001", "policy")

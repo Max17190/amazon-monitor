@@ -268,11 +268,13 @@ class PostgresOutboxRepository:
         delivered_at,
         status_code,
         duration_seconds,
+        attempts,
     ):
         await self.store.mark_delivery_succeeded(
             UUID(delivery_id),
             duration_ms=float(duration_seconds) * 1000.0,
             remote_request_id=str(status_code) if status_code else None,
+            attempts=attempts,
         )
 
     async def retry(
@@ -298,6 +300,7 @@ class PostgresOutboxRepository:
             previous_backoff_seconds=delay,
             circuit_failure_threshold=self.circuit_failure_threshold,
             circuit_open_seconds=self.circuit_open_seconds,
+            attempts=attempts,
         )
 
     async def dead_letter(
@@ -317,6 +320,7 @@ class PostgresOutboxRepository:
             error_class=error_class.value,
             http_status=status_code,
             retention_days=self.dead_letter_retention_days,
+            attempts=attempts,
         )
 
 

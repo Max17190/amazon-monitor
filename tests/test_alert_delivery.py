@@ -419,6 +419,38 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.wait_for(task, timeout=0.2), 4)
         self.assertEqual(sender.peak, 2)
 
+    async def test_failed_prelease_drain_requeues_failed_and_pending_rows(self):
+        class FailingOutbox(EmptyOutbox):
+            async def succeed(self, delivery_id, **kwargs):
+                self.calls.append(("success", delivery_id, kwargs))
+                if delivery_id == "preleased-0":
+                    raise RuntimeError("database unavailable")
+
+        repository = FailingOutbox([])
+        wakeup = OutboxWakeup()
+        worker = AlertDeliveryWorker(
+            repository,
+            Sender(DeliveryAttempt(True, 204)),
+            concurrency=2,
+            wakeup=wakeup,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id=f"target-{index}")
+            for index in range(4)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await worker._drain(preleased=deliveries)
+
+        self.assertEqual(
+            {
+                delivery.delivery_id
+                for delivery in wakeup.take_preleased()
+            },
+            {"preleased-0", "preleased-2", "preleased-3"},
+        )
+
 
 class WakeupTests(unittest.IsolatedAsyncioTestCase):
     async def test_wakeup_coalesces_ids_and_notification_payloads(self):
