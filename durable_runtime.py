@@ -20,6 +20,7 @@ from discord import Embed, Webhook
 from alert_delivery import (
     AlertDelivery,
     AlertDeliveryWorker,
+    DeliveryStatus,
     DeliveryAttempt,
     DeliveryTarget,
     ErrorClass,
@@ -586,6 +587,10 @@ class DurableStockCoordinator:
         metrics,
         tracer=None,
         outbox_wakeup=None,
+        delivery_worker_id=None,
+        delivery_lease_seconds=30.0,
+        delivery_global_limit=32,
+        delivery_per_target_limit=2,
     ):
         self.store = store
         self.config = config
@@ -597,6 +602,15 @@ class DurableStockCoordinator:
         self.metrics = metrics
         self.tracer = tracer
         self.outbox_wakeup = outbox_wakeup
+        self.delivery_worker_id = delivery_worker_id
+        self.delivery_lease_seconds = float(delivery_lease_seconds)
+        self.delivery_global_limit = int(delivery_global_limit)
+        self.delivery_per_target_limit = int(delivery_per_target_limit)
+        self.targets_by_id = {
+            target.name: target
+            for targets in asin_targets.values()
+            for target in targets
+        }
         self.policy = SellerPolicy(
             require_amazon_seller=config.require_amazon_seller
         )
@@ -969,6 +983,10 @@ class DurableStockCoordinator:
                     [item[2] for item in prepared],
                     lease_credential_key=lease_credential_key,
                     lease_owner=lease_owner,
+                    prelease_worker_id=self.delivery_worker_id,
+                    prelease_lease_seconds=self.delivery_lease_seconds,
+                    prelease_global_limit=self.delivery_global_limit,
+                    prelease_per_target_limit=self.delivery_per_target_limit,
                 )
                 self.metrics.observe(
                     "stock_response_to_commit_seconds",
@@ -982,9 +1000,22 @@ class DurableStockCoordinator:
                 )
                 if result.delivery_ids and self.outbox_wakeup is not None:
                     wake_started = time.monotonic()
-                    self.outbox_wakeup.wake(
-                        str(value) for value in result.delivery_ids
+                    preleased = self._preleased_deliveries(
+                        prepared,
+                        result.preleased_delivery_ids,
                     )
+                    if preleased:
+                        self.outbox_wakeup.wake_preleased(preleased)
+                    preleased_ids = {
+                        str(value) for value in result.preleased_delivery_ids
+                    }
+                    pending_ids = tuple(
+                        str(value)
+                        for value in result.delivery_ids
+                        if str(value) not in preleased_ids
+                    )
+                    if pending_ids:
+                        self.outbox_wakeup.wake(pending_ids)
                     self.metrics.observe(
                         "alert_commit_to_wake_seconds",
                         time.monotonic() - wake_started,
@@ -1011,6 +1042,44 @@ class DurableStockCoordinator:
                 self.metrics.increment("stock_state_conflict_total")
                 continue
         raise StateConflict("stock state changed repeatedly during batch observation")
+
+    def _preleased_deliveries(self, prepared, delivery_ids):
+        wanted = {str(value) for value in delivery_ids}
+        if not wanted:
+            return ()
+        claimed_at = time.time()
+        deliveries = []
+        for _, _, decision in prepared:
+            if decision.alert is None:
+                continue
+            payload = decision.alert.payload
+            for target_write in decision.targets:
+                delivery_id = str(target_write.delivery_id)
+                if delivery_id not in wanted:
+                    continue
+                configured = self.targets_by_id.get(target_write.target_id)
+                target = DeliveryTarget(
+                    target_id=target_write.target_id,
+                    url=configured.url if configured else "",
+                    kind=target_write.target_kind,
+                )
+                deliveries.append(
+                    AlertDelivery(
+                        delivery_id=delivery_id,
+                        alert_id=str(decision.alert.alert_id),
+                        target=target,
+                        payload=payload,
+                        created_at=claimed_at,
+                        attempts=0,
+                        leased_until=(
+                            claimed_at + self.delivery_lease_seconds
+                        ),
+                        status=DeliveryStatus.LEASED,
+                        trace_context=decision.alert.trace_context,
+                        claimed_at=claimed_at,
+                    )
+                )
+        return tuple(deliveries)
 
     def _alert_writes(self, transition, product_data, confirmed):
         alert_id = uuid4()
@@ -1793,6 +1862,15 @@ async def run_durable_monitor(config, webhook_targets):
         runtime_status = RuntimeStatus()
         tracer = configure_tracing()
         outbox_wakeup = OutboxWakeup()
+        worker_concurrency = int(
+            os.getenv("ALERT_WORKER_CONCURRENCY", "32")
+        )
+        target_concurrency = int(
+            os.getenv("ALERT_TARGET_CONCURRENCY", "2")
+        )
+        delivery_lease_seconds = float(
+            os.getenv("ALERT_LEASE_SECONDS", "30")
+        )
         coordinator = DurableStockCoordinator(
             store,
             effective_config,
@@ -1804,6 +1882,10 @@ async def run_durable_monitor(config, webhook_targets):
             metrics,
             tracer=tracer,
             outbox_wakeup=outbox_wakeup,
+            delivery_worker_id=owner_id,
+            delivery_lease_seconds=delivery_lease_seconds,
+            delivery_global_limit=worker_concurrency,
+            delivery_per_target_limit=target_concurrency,
         )
         stop_event = asyncio.Event()
 
@@ -1836,12 +1918,6 @@ async def run_durable_monitor(config, webhook_targets):
             aiohttp.ClientSession(connector=tvss_connector) as tvss_session,
             aiohttp.ClientSession(connector=alert_connector) as alert_session,
         ):
-            worker_concurrency = int(
-                os.getenv("ALERT_WORKER_CONCURRENCY", "32")
-            )
-            target_concurrency = int(
-                os.getenv("ALERT_TARGET_CONCURRENCY", "2")
-            )
             circuit_failure_threshold = int(
                 os.getenv("ALERT_CIRCUIT_FAILURE_THRESHOLD", "5")
             )
@@ -1873,9 +1949,7 @@ async def run_durable_monitor(config, webhook_targets):
                 health=delivery_health,
                 concurrency=worker_concurrency,
                 per_target_concurrency=target_concurrency,
-                lease_seconds=float(
-                    os.getenv("ALERT_LEASE_SECONDS", "30")
-                ),
+                lease_seconds=delivery_lease_seconds,
                 max_attempts=int(os.getenv("ALERT_MAX_ATTEMPTS", "10")),
                 max_age_seconds=float(
                     os.getenv("ALERT_MAX_AGE_SECONDS", "900")

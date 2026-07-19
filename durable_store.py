@@ -98,6 +98,7 @@ class BatchCommitResult:
     transition_ids: tuple[UUID, ...]
     delivery_ids: tuple[UUID, ...]
     verification_job_ids: tuple[UUID, ...]
+    preleased_delivery_ids: tuple[UUID, ...] = ()
 
     @property
     def transition_created(self):
@@ -373,6 +374,10 @@ class PostgresStore:
         *,
         lease_credential_key=None,
         lease_owner=None,
+        prelease_worker_id=None,
+        prelease_lease_seconds=30.0,
+        prelease_global_limit=32,
+        prelease_per_target_limit=2,
     ) -> BatchCommitResult:
         """Commit accepted decisions, transitions, outbox rows, and jobs atomically.
 
@@ -385,6 +390,14 @@ class PostgresStore:
             return BatchCommitResult({}, (), (), ())
         if len({item.scope for item in decisions}) != len(decisions):
             raise ValueError("batch decisions must contain one mutation per scope")
+        if prelease_worker_id is not None:
+            if float(prelease_lease_seconds) <= 0:
+                raise ValueError("prelease duration must be positive")
+            if (
+                int(prelease_global_limit) < 1
+                or int(prelease_per_target_limit) < 1
+            ):
+                raise ValueError("prelease concurrency limits must be positive")
         state_rows = []
         transition_rows = []
         alert_rows = []
@@ -459,6 +472,23 @@ class PostgresStore:
                     "evidence": _jsonable(verification.evidence),
                     "ttl_seconds": verification.ttl_seconds,
                 })
+        global_prelease_limit = int(prelease_global_limit)
+        target_prelease_limit = int(prelease_per_target_limit)
+        remaining_preleases = (
+            global_prelease_limit if prelease_worker_id is not None else 0
+        )
+        preleases_by_target = {}
+        for row in delivery_rows:
+            target_id = row["target_id"]
+            target_count = preleases_by_target.get(target_id, 0)
+            selected = (
+                remaining_preleases > 0
+                and target_count < target_prelease_limit
+            )
+            row["prelease"] = selected
+            if selected:
+                remaining_preleases -= 1
+                preleases_by_target[target_id] = target_count + 1
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 if lease_credential_key is not None or lease_owner is not None:
@@ -566,17 +596,48 @@ class PostgresStore:
                     ), delivery_input AS (
                         SELECT * FROM jsonb_to_recordset($4::jsonb) AS x(
                             delivery_id uuid, alert_id uuid, target_id text,
-                            target_kind text, payload_version integer
+                            target_kind text, payload_version integer,
+                            prelease boolean
                         )
                     ), inserted_deliveries AS (
                         INSERT INTO alert_deliveries (
-                        delivery_id, alert_id, target_id, target_kind, payload_version
-                    ) SELECT delivery_id, delivery_input.alert_id, target_id,
-                        target_kind, delivery_input.payload_version
+                            delivery_id, alert_id, target_id, target_kind,
+                            payload_version, status, attempts, leased_by,
+                            leased_until, first_attempt_at, last_attempt_at
+                        )
+                    SELECT delivery_input.delivery_id,
+                        delivery_input.alert_id,
+                        delivery_input.target_id,
+                        delivery_input.target_kind,
+                        delivery_input.payload_version,
+                        CASE WHEN NOT prelease.selected
+                            THEN 'pending' ELSE 'leased' END,
+                        CASE WHEN NOT prelease.selected
+                            THEN 0 ELSE 1 END,
+                        CASE WHEN NOT prelease.selected
+                            THEN NULL ELSE $7::text END,
+                        CASE WHEN NOT prelease.selected
+                            THEN NULL ELSE clock_timestamp()
+                                + ($8::double precision
+                                   * INTERVAL '1 second') END,
+                        CASE WHEN NOT prelease.selected
+                            THEN NULL ELSE clock_timestamp() END,
+                        CASE WHEN NOT prelease.selected
+                            THEN NULL ELSE clock_timestamp() END
                     FROM delivery_input JOIN inserted_alerts
                         ON inserted_alerts.alert_id = delivery_input.alert_id
+                    LEFT JOIN alert_target_circuits AS circuit
+                        ON circuit.target_id = delivery_input.target_id
+                       AND circuit.open_until > clock_timestamp()
+                    CROSS JOIN LATERAL (
+                        VALUES (
+                            $7::text IS NOT NULL
+                            AND delivery_input.prelease
+                            AND circuit.target_id IS NULL
+                        )
+                    ) AS prelease(selected)
                     ON CONFLICT (alert_id, target_id, payload_version) DO NOTHING
-                    RETURNING delivery_id
+                    RETURNING delivery_id, status
                     ), verification_input AS (
                         SELECT * FROM jsonb_to_recordset($5::jsonb) AS x(
                             job_id uuid, monitor_id text, marketplace_id text, asin text,
@@ -631,6 +692,10 @@ class PostgresStore:
                             SELECT delivery_id FROM inserted_deliveries
                         ) AS delivery_ids,
                         ARRAY(
+                            SELECT delivery_id FROM inserted_deliveries
+                            WHERE status = 'leased'
+                        ) AS preleased_delivery_ids,
+                        ARRAY(
                             SELECT job_id FROM inserted_verifications
                         ) AS verification_job_ids,
                         (SELECT sent FROM notification) AS notification_sent
@@ -641,6 +706,9 @@ class PostgresStore:
                     json.dumps(delivery_rows),
                     json.dumps(verification_rows),
                     OUTBOX_NOTIFICATION_DELIVERY_ID_LIMIT,
+                    str(prelease_worker_id)
+                    if prelease_worker_id is not None else None,
+                    float(prelease_lease_seconds),
                 )
                 state_result = result["state_results"]
                 if isinstance(state_result, str):
@@ -656,11 +724,18 @@ class PostgresStore:
                 }
                 transition_ids = tuple(result["transition_ids"] or ())
                 delivery_ids = tuple(result["delivery_ids"] or ())
+                preleased_delivery_ids = tuple(
+                    result["preleased_delivery_ids"] or ()
+                )
                 verification_job_ids = tuple(
                     result["verification_job_ids"] or ()
                 )
         return BatchCommitResult(
-            versions, transition_ids, delivery_ids, verification_job_ids,
+            versions,
+            transition_ids,
+            delivery_ids,
+            verification_job_ids,
+            preleased_delivery_ids,
         )
 
     async def commit_stock_decision(

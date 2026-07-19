@@ -541,9 +541,9 @@ TEST_DATABASE_URL=postgresql://monitor:monitor@localhost:5432/amazon_monitor \
 python durable_latency_benchmark.py --confirm-database-writes
 ```
 
-This requires 20-ASIN response-to-commit p95 below 10 ms,
-commit-to-first-attempt p95 below 10 ms, and response-to-local-acceptance p95
-below 25 ms. The benchmark removes its uniquely scoped rows on completion.
+This requires 20-ASIN response-to-commit p95 below 20 ms,
+commit-to-first-attempt p95 below 1 ms, and response-to-local-acceptance p95
+below 20 ms. The benchmark removes its uniquely scoped rows on completion.
 
 Run public proxy health checks without authenticated TVSS traffic:
 

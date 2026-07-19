@@ -133,6 +133,7 @@ class OutboxWakeup:
         self._event = asyncio.Event()
         self._preferred_delivery_ids: set[str] = set()
         self._woken_at: dict[str, float] = {}
+        self._preleased: dict[str, AlertDelivery] = {}
 
     def wake(self, delivery_ids: Iterable[str] = ()) -> None:
         now = time.time()
@@ -143,6 +144,23 @@ class OutboxWakeup:
         self._event.set()
 
     notify = wake
+
+    def wake_preleased(self, deliveries: Iterable[AlertDelivery]) -> None:
+        """Queue rows leased by the commit transaction for immediate delivery."""
+        now = time.time()
+        for delivery in deliveries:
+            delivery_id = str(delivery.delivery_id)
+            self._preleased.setdefault(delivery_id, delivery)
+            self._woken_at.setdefault(delivery_id, now)
+        if self._preleased:
+            self._event.set()
+
+    def take_preleased(self) -> tuple[AlertDelivery, ...]:
+        deliveries = tuple(self._preleased.values())
+        self._preleased.clear()
+        for delivery in deliveries:
+            self._woken_at.pop(str(delivery.delivery_id), None)
+        return deliveries
 
     def take_preferred_delivery_ids(self) -> tuple[str, ...]:
         """Return and clear coalesced preferred IDs without blocking."""
@@ -434,11 +452,20 @@ class AlertDeliveryWorker:
         await asyncio.gather(*(self._deliver(row) for row in claimed))
         return len(claimed)
 
-    async def _drain(self, *, preferred_delivery_ids: Iterable[str] = ()) -> int:
+    async def _drain(
+        self,
+        *,
+        preferred_delivery_ids: Iterable[str] = (),
+        preleased: Iterable[AlertDelivery] = (),
+    ) -> int:
         """Drain due work, merging committed IDs before each later claim."""
         total = 0
         pending_preferred: deque[str] = deque()
         queued_preferred: set[str] = set()
+        pending_preleased: deque[AlertDelivery] = deque(preleased)
+        queued_preleased = {
+            str(delivery.delivery_id) for delivery in pending_preleased
+        }
 
         def enqueue_preferred(delivery_ids: Iterable[str]) -> None:
             for delivery_id in delivery_ids:
@@ -448,6 +475,26 @@ class AlertDeliveryWorker:
 
         enqueue_preferred(preferred_delivery_ids)
         while not self._stopping.is_set():
+            for delivery in self.wakeup.take_preleased():
+                delivery_id = str(delivery.delivery_id)
+                if delivery_id not in queued_preleased:
+                    pending_preleased.append(delivery)
+                    queued_preleased.add(delivery_id)
+            if pending_preleased:
+                claimed = tuple(
+                    pending_preleased.popleft()
+                    for _ in range(
+                        min(self.claim_limit, len(pending_preleased))
+                    )
+                )
+                queued_preleased.difference_update(
+                    str(delivery.delivery_id) for delivery in claimed
+                )
+                await asyncio.gather(
+                    *(self._deliver(delivery) for delivery in claimed)
+                )
+                total += len(claimed)
+                continue
             # Commits can arrive while a prior batch is delivered. Merge them
             # immediately before every claim, then consume one bounded FIFO
             # slice. Each ID gets one priority opportunity, so stale or
@@ -485,11 +532,16 @@ class AlertDeliveryWorker:
             raise ValueError("poll interval must be positive")
         self.health.worker_running = True
         preferred = self.wakeup.take_preferred_delivery_ids()
+        preleased = self.wakeup.take_preleased()
         try:
             while not self._stopping.is_set():
                 try:
-                    await self._drain(preferred_delivery_ids=preferred)
+                    await self._drain(
+                        preferred_delivery_ids=preferred,
+                        preleased=preleased,
+                    )
                     preferred = ()
+                    preleased = ()
                     self.health.repository_ready = True
                     self.health.last_error = None
                 except asyncio.CancelledError:
@@ -508,10 +560,12 @@ class AlertDeliveryWorker:
                     preferred = await asyncio.wait_for(
                         self.wakeup.wait(), timeout=fallback_seconds
                     )
+                    preleased = self.wakeup.take_preleased()
                 except asyncio.TimeoutError:
                     # A fallback scan recovers rows after process crashes or a
                     # missed LISTEN/NOTIFY event.
                     preferred = ()
+                    preleased = ()
         finally:
             self.health.worker_running = False
 

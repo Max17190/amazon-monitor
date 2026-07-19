@@ -15,7 +15,14 @@ from uuid import UUID, uuid4
 import aiohttp
 from aiohttp import web
 
-from alert_delivery import AlertDeliveryWorker, GenericWebhookSender, OutboxWakeup
+from alert_delivery import (
+    AlertDelivery,
+    AlertDeliveryWorker,
+    DeliveryStatus,
+    DeliveryTarget,
+    GenericWebhookSender,
+    OutboxWakeup,
+)
 from amazon_tvss import TVSSClient
 from credential_governor import PostgresCredentialGovernor
 from durable_runtime import PostgresOutboxRepository
@@ -243,9 +250,48 @@ async def run(database_url, iterations, warmup_iterations=10):
                     decisions,
                     lease_credential_key=credential_key,
                     lease_owner=lease_owner,
+                    prelease_worker_id=monitor_id,
+                    prelease_lease_seconds=30,
+                    prelease_global_limit=32,
+                    prelease_per_target_limit=2,
                 )
                 committed_at = time.perf_counter()
-                wakeup.wake(str(value) for value in result.delivery_ids)
+                preleased_ids = {
+                    str(value) for value in result.preleased_delivery_ids
+                }
+                claimed_at = time.time()
+                preleased = []
+                for decision in decisions:
+                    if decision.alert is None:
+                        continue
+                    for target_write in decision.targets:
+                        delivery_id = str(target_write.delivery_id)
+                        if delivery_id not in preleased_ids:
+                            continue
+                        preleased.append(
+                            AlertDelivery(
+                                delivery_id=delivery_id,
+                                alert_id=str(decision.alert.alert_id),
+                                target=DeliveryTarget(
+                                    target_id=target.name,
+                                    url=target.url,
+                                    kind=target.kind,
+                                ),
+                                payload=decision.alert.payload,
+                                created_at=claimed_at,
+                                attempts=0,
+                                leased_until=claimed_at + 30,
+                                status=DeliveryStatus.LEASED,
+                                trace_context=decision.alert.trace_context,
+                                claimed_at=claimed_at,
+                            )
+                        )
+                wakeup.wake_preleased(preleased)
+                wakeup.wake(
+                    str(value)
+                    for value in result.delivery_ids
+                    if str(value) not in preleased_ids
+                )
                 deadline = time.monotonic() + 3
                 while not all(value in accepted_at for value in expected):
                     remaining = deadline - time.monotonic()
@@ -281,23 +327,30 @@ async def run(database_url, iterations, warmup_iterations=10):
         "iterations": iterations,
         "warmup_iterations": warmup_iterations,
         "asins": len(ASINS),
+        "response_to_commit_p50_ms": round(percentile(commit_ms, 50), 3),
         "response_to_commit_p95_ms": round(percentile(commit_ms, 95), 3),
+        "commit_to_first_attempt_p50_ms": round(
+            percentile(commit_to_attempt_ms, 50), 3
+        ),
         "commit_to_first_attempt_p95_ms": round(
             percentile(commit_to_attempt_ms, 95), 3
+        ),
+        "response_to_local_accept_p50_ms": round(
+            percentile(response_to_accept_ms, 50), 3
         ),
         "response_to_local_accept_p95_ms": round(
             percentile(response_to_accept_ms, 95), 3
         ),
         "acceptance": {
-            "response_to_commit_p95_ms": 10,
-            "commit_to_first_attempt_p95_ms": 10,
-            "response_to_local_accept_p95_ms": 25,
+            "response_to_commit_p95_ms": 20,
+            "commit_to_first_attempt_p95_ms": 1,
+            "response_to_local_accept_p95_ms": 20,
         },
     }
     result["accepted"] = (
-        result["response_to_commit_p95_ms"] < 10
-        and result["commit_to_first_attempt_p95_ms"] < 10
-        and result["response_to_local_accept_p95_ms"] < 25
+        result["response_to_commit_p95_ms"] < 20
+        and result["commit_to_first_attempt_p95_ms"] < 1
+        and result["response_to_local_accept_p95_ms"] < 20
     )
     print(json.dumps(result, sort_keys=True))
     return 0 if result["accepted"] else 1

@@ -123,7 +123,7 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ) IS NOT NULL
                 """
             )
-        self.assertEqual(versions, 2)
+        self.assertEqual(versions, 3)
         self.assertTrue(circuits)
 
     async def test_transition_and_delivery_intents_commit_atomically(self):
@@ -216,6 +216,158 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
             *(target.delivery_id for target in second_targets),
         })
         self.assertEqual(len(result.verification_job_ids), 1)
+
+    async def test_batch_commit_preleases_with_global_and_target_capacity(self):
+        decisions = []
+        target_ids = ("same", "same", "other", "third")
+        writes = []
+        for index, target_id in enumerate(target_ids, start=1):
+            asin = f"B0000000{index:02d}"
+            scope = ScopeKey("monitor", "market", asin, "policy")
+            transition, alert, targets = self.writes(targets=(target_id,))
+            writes.append((transition, alert, targets))
+            decisions.append(
+                BatchStockDecision(
+                    scope,
+                    {
+                        **self.state(),
+                        "scope_key": f"monitor:market:{asin}:policy",
+                    },
+                    None,
+                    {"offer_id": f"offer-{index}"},
+                    transition,
+                    alert,
+                    targets,
+                )
+            )
+
+        result = await self.store.commit_stock_decisions(
+            decisions,
+            prelease_worker_id="commit-worker",
+            prelease_lease_seconds=30,
+            prelease_global_limit=3,
+            prelease_per_target_limit=1,
+        )
+        self.assertEqual(len(result.delivery_ids), 4)
+        self.assertEqual(len(result.preleased_delivery_ids), 3)
+        async with self.store.pool.acquire() as connection:
+            rows = await connection.fetch(
+                """
+                SELECT delivery_id, target_id, status, attempts, leased_by
+                FROM alert_deliveries
+                ORDER BY target_id, delivery_id
+                """
+            )
+        leased = [row for row in rows if row["status"] == "leased"]
+        pending = [row for row in rows if row["status"] == "pending"]
+        self.assertEqual(
+            {row["target_id"] for row in leased},
+            {"same", "other", "third"},
+        )
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["target_id"], "same")
+        self.assertTrue(
+            all(
+                row["attempts"] == 1
+                and row["leased_by"] == "commit-worker"
+                for row in leased
+            )
+        )
+        self.assertEqual(pending[0]["attempts"], 0)
+        self.assertIsNone(pending[0]["leased_by"])
+
+    async def test_prelease_respects_open_target_circuit(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes(targets=("open-target",))
+        async with self.store.pool.acquire() as connection:
+            await connection.execute(
+                """
+                INSERT INTO alert_target_circuits (
+                    target_id, consecutive_failures, open_until
+                ) VALUES (
+                    'open-target', 5, clock_timestamp() + INTERVAL '1 minute'
+                )
+                """
+            )
+        result = await self.store.commit_stock_decisions(
+            (
+                BatchStockDecision(
+                    scope,
+                    self.state(),
+                    None,
+                    {"offer_id": "offer"},
+                    transition,
+                    alert,
+                    targets,
+                ),
+            ),
+            prelease_worker_id="commit-worker",
+        )
+        self.assertEqual(result.preleased_delivery_ids, ())
+        async with self.store.pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """
+                SELECT status, attempts, leased_by
+                FROM alert_deliveries
+                WHERE delivery_id = $1
+                """,
+                targets[0].delivery_id,
+            )
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(row["attempts"], 0)
+        self.assertIsNone(row["leased_by"])
+
+    async def test_expired_commit_prelease_is_recovered_by_claim_loop(self):
+        scope = ScopeKey("monitor", "market", "B000000001", "policy")
+        transition, alert, targets = self.writes(targets=("recovery",))
+        result = await self.store.commit_stock_decisions(
+            (
+                BatchStockDecision(
+                    scope,
+                    self.state(),
+                    None,
+                    {"offer_id": "offer"},
+                    transition,
+                    alert,
+                    targets,
+                ),
+            ),
+            prelease_worker_id="commit-worker",
+            prelease_lease_seconds=30,
+        )
+        self.assertEqual(result.preleased_delivery_ids, (targets[0].delivery_id,))
+        self.assertEqual(
+            await self.store.claim_deliveries(
+                "recovery-worker",
+                limit=1,
+                lease_seconds=30,
+                global_limit=1,
+                per_target_limit=1,
+            ),
+            [],
+        )
+        async with self.store.pool.acquire() as connection:
+            await connection.execute(
+                """
+                UPDATE alert_deliveries
+                SET leased_until = clock_timestamp() - INTERVAL '1 second'
+                WHERE delivery_id = $1
+                """,
+                targets[0].delivery_id,
+            )
+        recovered = await self.store.claim_deliveries(
+            "recovery-worker",
+            limit=1,
+            lease_seconds=30,
+            global_limit=1,
+            per_target_limit=1,
+        )
+        self.assertEqual(
+            [row["delivery_id"] for row in recovered],
+            [targets[0].delivery_id],
+        )
+        self.assertEqual(recovered[0]["leased_by"], "recovery-worker")
+        self.assertEqual(recovered[0]["attempts"], 2)
 
     async def test_batch_commit_notifies_only_after_delivery_commit(self):
         scope = ScopeKey("monitor", "market", "B000000001", "policy")
