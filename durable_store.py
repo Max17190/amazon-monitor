@@ -98,6 +98,7 @@ class BatchCommitResult:
     transition_ids: tuple[UUID, ...]
     delivery_ids: tuple[UUID, ...]
     verification_job_ids: tuple[UUID, ...]
+    preleased_delivery_ids: tuple[UUID, ...] = ()
 
     @property
     def transition_created(self):
@@ -373,6 +374,10 @@ class PostgresStore:
         *,
         lease_credential_key=None,
         lease_owner=None,
+        prelease_worker_id=None,
+        prelease_lease_seconds=30.0,
+        prelease_global_limit=32,
+        prelease_per_target_limit=2,
     ) -> BatchCommitResult:
         """Commit accepted decisions, transitions, outbox rows, and jobs atomically.
 
@@ -385,6 +390,14 @@ class PostgresStore:
             return BatchCommitResult({}, (), (), ())
         if len({item.scope for item in decisions}) != len(decisions):
             raise ValueError("batch decisions must contain one mutation per scope")
+        if prelease_worker_id is not None:
+            if float(prelease_lease_seconds) <= 0:
+                raise ValueError("prelease duration must be positive")
+            if (
+                int(prelease_global_limit) < 1
+                or int(prelease_per_target_limit) < 1
+            ):
+                raise ValueError("prelease concurrency limits must be positive")
         state_rows = []
         transition_rows = []
         alert_rows = []
@@ -459,6 +472,8 @@ class PostgresStore:
                     "evidence": _jsonable(verification.evidence),
                     "ttl_seconds": verification.ttl_seconds,
                 })
+        for row in delivery_rows:
+            row["prelease"] = False
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 if lease_credential_key is not None or lease_owner is not None:
@@ -480,6 +495,53 @@ class PostgresStore:
                         raise CredentialLeaseFenceLost(
                             "TVSS credential leader lease is no longer held"
                         )
+                if prelease_worker_id is not None and delivery_rows:
+                    active_rows = await connection.fetch(
+                        """
+                        WITH delivery_claim_lock AS MATERIALIZED (
+                            SELECT pg_advisory_xact_lock($1::bigint)
+                        )
+                        SELECT delivery.target_id, COUNT(*)::integer AS count
+                        FROM alert_deliveries AS delivery,
+                            delivery_claim_lock
+                        WHERE delivery.status = 'leased'
+                          AND delivery.leased_until > clock_timestamp()
+                        GROUP BY delivery.target_id
+                        """,
+                        DELIVERY_CLAIM_LOCK_ID,
+                    )
+                    active_by_target = {
+                        row["target_id"]: int(row["count"])
+                        for row in active_rows
+                    }
+                    remaining_preleases = max(
+                        0,
+                        int(prelease_global_limit)
+                        - sum(active_by_target.values()),
+                    )
+                    target_prelease_limit = int(
+                        prelease_per_target_limit
+                    )
+                    selected_by_target = {}
+                    for row in delivery_rows:
+                        target_id = row["target_id"]
+                        selected_count = selected_by_target.get(
+                            target_id, 0
+                        )
+                        selected = (
+                            remaining_preleases > 0
+                            and (
+                                active_by_target.get(target_id, 0)
+                                + selected_count
+                                < target_prelease_limit
+                            )
+                        )
+                        row["prelease"] = selected
+                        if selected:
+                            remaining_preleases -= 1
+                            selected_by_target[target_id] = (
+                                selected_count + 1
+                            )
                 result = await connection.fetchrow(
                     """
                     WITH state_input AS (
@@ -566,17 +628,45 @@ class PostgresStore:
                     ), delivery_input AS (
                         SELECT * FROM jsonb_to_recordset($4::jsonb) AS x(
                             delivery_id uuid, alert_id uuid, target_id text,
-                            target_kind text, payload_version integer
+                            target_kind text, payload_version integer,
+                            prelease boolean
                         )
                     ), inserted_deliveries AS (
                         INSERT INTO alert_deliveries (
-                        delivery_id, alert_id, target_id, target_kind, payload_version
-                    ) SELECT delivery_id, delivery_input.alert_id, target_id,
-                        target_kind, delivery_input.payload_version
+                            delivery_id, alert_id, target_id, target_kind,
+                            payload_version, status, attempts, leased_by,
+                            leased_until, first_attempt_at, last_attempt_at
+                        )
+                    SELECT delivery_input.delivery_id,
+                        delivery_input.alert_id,
+                        delivery_input.target_id,
+                        delivery_input.target_kind,
+                        delivery_input.payload_version,
+                        CASE WHEN NOT prelease.selected
+                            THEN 'pending' ELSE 'leased' END,
+                        0,
+                        CASE WHEN NOT prelease.selected
+                            THEN NULL ELSE $7::text END,
+                        CASE WHEN NOT prelease.selected
+                            THEN NULL ELSE clock_timestamp()
+                                + ($8::double precision
+                                   * INTERVAL '1 second') END,
+                        NULL,
+                        NULL
                     FROM delivery_input JOIN inserted_alerts
                         ON inserted_alerts.alert_id = delivery_input.alert_id
+                    LEFT JOIN alert_target_circuits AS circuit
+                        ON circuit.target_id = delivery_input.target_id
+                       AND circuit.open_until > clock_timestamp()
+                    CROSS JOIN LATERAL (
+                        VALUES (
+                            $7::text IS NOT NULL
+                            AND delivery_input.prelease
+                            AND circuit.target_id IS NULL
+                        )
+                    ) AS prelease(selected)
                     ON CONFLICT (alert_id, target_id, payload_version) DO NOTHING
-                    RETURNING delivery_id
+                    RETURNING delivery_id, status
                     ), verification_input AS (
                         SELECT * FROM jsonb_to_recordset($5::jsonb) AS x(
                             job_id uuid, monitor_id text, marketplace_id text, asin text,
@@ -631,6 +721,10 @@ class PostgresStore:
                             SELECT delivery_id FROM inserted_deliveries
                         ) AS delivery_ids,
                         ARRAY(
+                            SELECT delivery_id FROM inserted_deliveries
+                            WHERE status = 'leased'
+                        ) AS preleased_delivery_ids,
+                        ARRAY(
                             SELECT job_id FROM inserted_verifications
                         ) AS verification_job_ids,
                         (SELECT sent FROM notification) AS notification_sent
@@ -641,6 +735,9 @@ class PostgresStore:
                     json.dumps(delivery_rows),
                     json.dumps(verification_rows),
                     OUTBOX_NOTIFICATION_DELIVERY_ID_LIMIT,
+                    str(prelease_worker_id)
+                    if prelease_worker_id is not None else None,
+                    float(prelease_lease_seconds),
                 )
                 state_result = result["state_results"]
                 if isinstance(state_result, str):
@@ -656,11 +753,18 @@ class PostgresStore:
                 }
                 transition_ids = tuple(result["transition_ids"] or ())
                 delivery_ids = tuple(result["delivery_ids"] or ())
+                preleased_delivery_ids = tuple(
+                    result["preleased_delivery_ids"] or ()
+                )
                 verification_job_ids = tuple(
                     result["verification_job_ids"] or ()
                 )
         return BatchCommitResult(
-            versions, transition_ids, delivery_ids, verification_job_ids,
+            versions,
+            transition_ids,
+            delivery_ids,
+            verification_job_ids,
+            preleased_delivery_ids,
         )
 
     async def commit_stock_decision(
@@ -1231,6 +1335,7 @@ class PostgresStore:
         delivery_id,
         duration_ms,
         remote_request_id=None,
+        attempts=None,
     ):
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -1242,6 +1347,13 @@ class PostgresStore:
                         leased_until = NULL,
                         delivered_at = clock_timestamp(),
                         remote_request_id = $2,
+                        attempts = GREATEST(
+                            attempts, COALESCE($3::integer, attempts)
+                        ),
+                        first_attempt_at = COALESCE(
+                            first_attempt_at, clock_timestamp()
+                        ),
+                        last_attempt_at = clock_timestamp(),
                         last_error_class = NULL,
                         last_http_status = NULL,
                         updated_at = clock_timestamp()
@@ -1250,6 +1362,7 @@ class PostgresStore:
                     """,
                     delivery_id,
                     remote_request_id,
+                    attempts,
                 )
                 if row:
                     await connection.execute(
@@ -1274,6 +1387,41 @@ class PostgresStore:
                     )
                     await self._refresh_alert_lifecycle(connection, row["alert_id"])
 
+    async def release_preleased_deliveries(
+        self,
+        worker_id,
+        delivery_ids,
+    ):
+        delivery_ids = tuple(delivery_ids)
+        if not delivery_ids:
+            return ()
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                rows = await connection.fetch(
+                    """
+                    UPDATE alert_deliveries
+                    SET status = 'pending',
+                        leased_by = NULL,
+                        leased_until = NULL,
+                        next_attempt_at = clock_timestamp(),
+                        updated_at = clock_timestamp()
+                    WHERE delivery_id = ANY($1::uuid[])
+                      AND status = 'leased'
+                      AND leased_by = $2
+                      AND attempts = 0
+                    RETURNING delivery_id
+                    """,
+                    [UUID(value) for value in delivery_ids],
+                    str(worker_id),
+                )
+                released = tuple(row["delivery_id"] for row in rows)
+                if released:
+                    await connection.execute(
+                        "SELECT pg_notify('alert_outbox_ready', $1)",
+                        _outbox_notification_payload(released),
+                    )
+        return released
+
     async def reschedule_delivery(
         self,
         delivery_id,
@@ -1285,6 +1433,7 @@ class PostgresStore:
         previous_backoff_seconds=None,
         circuit_failure_threshold=5,
         circuit_open_seconds=60.0,
+        attempts=None,
     ):
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -1295,6 +1444,13 @@ class PostgresStore:
                         next_attempt_at = clock_timestamp()
                             + ($2::double precision * INTERVAL '1 second'),
                         previous_backoff_seconds = $3,
+                        attempts = GREATEST(
+                            attempts, COALESCE($6::integer, attempts)
+                        ),
+                        first_attempt_at = COALESCE(
+                            first_attempt_at, clock_timestamp()
+                        ),
+                        last_attempt_at = clock_timestamp(),
                         leased_by = NULL,
                         leased_until = NULL,
                         last_error_class = $4,
@@ -1308,6 +1464,7 @@ class PostgresStore:
                     previous_backoff_seconds,
                     error_class,
                     http_status,
+                    attempts,
                 )
                 if row:
                     await connection.execute(
@@ -1361,6 +1518,7 @@ class PostgresStore:
         error_class=None,
         http_status=None,
         retention_days=30,
+        attempts=None,
     ):
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -1370,6 +1528,14 @@ class PostgresStore:
                     SET status = 'dead_lettered',
                         leased_by = NULL,
                         leased_until = NULL,
+                        attempts = GREATEST(
+                            delivery.attempts,
+                            COALESCE($4::integer, delivery.attempts)
+                        ),
+                        first_attempt_at = COALESCE(
+                            delivery.first_attempt_at, clock_timestamp()
+                        ),
+                        last_attempt_at = clock_timestamp(),
                         last_error_class = $2,
                         last_http_status = $3,
                         updated_at = clock_timestamp()
@@ -1385,6 +1551,7 @@ class PostgresStore:
                     delivery_id,
                     error_class,
                     http_status,
+                    attempts,
                 )
                 if not row:
                     return

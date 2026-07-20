@@ -30,7 +30,13 @@ export RAILWAY_CANARY_MODE="${RAILWAY_CANARY_MODE:-latency}"
 
 python hot_path_benchmark.py --iterations 10000
 
-if [ "$RAILWAY_CANARY_MODE" = "cadence" ]; then
+if [ "$RAILWAY_CANARY_MODE" = "durable-latency" ]; then
+  python durable_latency_benchmark.py \
+    --database-url "${DATABASE_URL:?DATABASE_URL is required}" \
+    --iterations "${DURABLE_LATENCY_ITERATIONS:-100}" \
+    --warmup-iterations "${DURABLE_LATENCY_WARMUP_ITERATIONS:-10}" \
+    --confirm-database-writes
+elif [ "$RAILWAY_CANARY_MODE" = "cadence" ]; then
   python cadence_canary.py \
     --confirm \
     --asins "${CANARY_ASINS:-$LATENCY_ASINS}" \

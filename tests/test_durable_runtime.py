@@ -36,6 +36,7 @@ class FakeStockStore:
         self.verification_ttls = []
         self.bulk_loads = 0
         self.committed_scopes = []
+        self.commit_options = {}
 
     async def load_product_state(self, scope):
         return self.rows.get(scope)
@@ -86,11 +87,12 @@ class FakeStockStore:
     async def commit_stock_decisions(
         self,
         decisions,
-        **_lease,
+        **options,
     ):
         from durable_store import BatchCommitResult
 
         decisions = tuple(decisions)
+        self.commit_options = options
         self.committed_scopes = [item.scope for item in decisions]
         next_rows = dict(self.rows)
         transitions = []
@@ -123,6 +125,11 @@ class FakeStockStore:
             tuple(transition_ids),
             tuple(delivery_ids),
             tuple(uuid4() for _ in verifications),
+            (
+                tuple(delivery_ids)
+                if options.get("prelease_worker_id") is not None
+                else ()
+            ),
         )
 
 
@@ -365,6 +372,77 @@ class DurableStockIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result.versions), 2)
         self.assertEqual(len(self.store.rows), 2)
         self.assertEqual(len(self.store.verifications), 1)
+
+    async def test_commit_preleased_rows_are_queued_without_a_second_claim(self):
+        from alert_delivery import OutboxWakeup
+
+        wakeup = OutboxWakeup()
+        self.coordinator.outbox_wakeup = wakeup
+        self.coordinator.delivery_worker_id = "worker"
+        product = {
+            "asin": self.asin,
+            "title": "Product",
+            "link": "https://www.amazon.com/dp/B000000001",
+            "images": [],
+            "source": "tvss",
+        }
+        for sequence in (1, 2, 3):
+            await self.coordinator.process_batch(
+                ((
+                    self.evidence(
+                        sequence,
+                        EvidenceSource.BATCH,
+                        offer_explicitly_null=True,
+                        availability_condition="OUT_OF_STOCK",
+                    ),
+                    product,
+                ),)
+            )
+        await self.coordinator.process_batch(
+            ((
+                self.evidence(
+                    4,
+                    EvidenceSource.BATCH,
+                    offer_id="offer",
+                    availability_condition="IN_STOCK",
+                ),
+                product,
+            ),)
+        )
+        await self.coordinator.process_batch(
+            ((
+                self.evidence(
+                    5,
+                    EvidenceSource.FULL_PRODUCT,
+                    offer_id="offer",
+                    sold_by_amazon=True,
+                    seller_name="Amazon.com",
+                    availability_status="IN_STOCK",
+                ),
+                {
+                    **product,
+                    "price": "$10.00",
+                    "seller": "Amazon.com",
+                    "seller_verified": True,
+                },
+            ),)
+        )
+
+        preleased = wakeup.take_preleased()
+        self.assertEqual(len(preleased), 2)
+        self.assertEqual(
+            {item.target.target_id for item in preleased},
+            {"A", "B"},
+        )
+        self.assertEqual(
+            {item.target.url for item in preleased},
+            {"https://a.example", "https://b.example"},
+        )
+        self.assertEqual(wakeup.take_preferred_delivery_ids(), ())
+        self.assertEqual(
+            self.store.commit_options["prelease_worker_id"],
+            "worker",
+        )
 
     async def test_fast_alert_promotes_short_confirmation_ttl_to_cadence_window(self):
         self.coordinator.config.fast_alert = True

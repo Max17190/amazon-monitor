@@ -72,6 +72,12 @@ class QueueOutbox(MemoryOutbox):
         return claimed
 
 
+class EmptyOutbox(MemoryOutbox):
+    async def claim_due(self, *, limit, now, lease_seconds, **_kwargs):
+        self.calls.append(("claim", limit))
+        return []
+
+
 def row(*, attempts=0, created_at=100.0, delivery_id="delivery-1", target_id="discord-main"):
     return AlertDelivery(delivery_id, f"alert-{delivery_id}", DeliveryTarget(target_id, "https://example.test"),
                          {"asin": "B000000001"}, created_at, attempts=attempts, status=DeliveryStatus.LEASED)
@@ -354,6 +360,137 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await worker.run_once(preferred_delivery_ids=["legacy"]), 1)
         self.assertEqual(repository.calls[0][1], "legacy")
 
+    async def test_preleased_row_is_sent_before_any_repository_claim(self):
+        repository = EmptyOutbox([])
+        sender = RecordingSender(DeliveryAttempt(True, 204))
+        wakeup = OutboxWakeup()
+        delivery = row(delivery_id="preleased")
+        wakeup.wake_preleased((delivery,))
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            wakeup=wakeup,
+            clock=lambda: 110,
+        )
+
+        self.assertEqual(
+            await worker._drain(preleased=wakeup.take_preleased()),
+            1,
+        )
+        self.assertTrue(sender.sent.is_set())
+        self.assertEqual(repository.calls[0][0], "success")
+        self.assertEqual(repository.calls[1][0], "claim")
+
+    async def test_preleased_rows_still_obey_target_send_concurrency(self):
+        class BlockingSender:
+            def __init__(self):
+                self.active = 0
+                self.peak = 0
+                self.two_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send(self, _delivery):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                if self.active == 2:
+                    self.two_started.set()
+                await self.release.wait()
+                self.active -= 1
+                return DeliveryAttempt(True, 204)
+
+        repository = EmptyOutbox([])
+        sender = BlockingSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=4,
+            per_target_concurrency=2,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id="same")
+            for index in range(4)
+        )
+        task = asyncio.create_task(worker._drain(preleased=deliveries))
+        await asyncio.wait_for(sender.two_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        self.assertEqual(sender.peak, 2)
+        sender.release.set()
+        self.assertEqual(await asyncio.wait_for(task, timeout=0.2), 4)
+        self.assertEqual(sender.peak, 2)
+
+    async def test_failed_prelease_drain_requeues_failed_and_pending_rows(self):
+        class FailingOutbox(EmptyOutbox):
+            async def succeed(self, delivery_id, **kwargs):
+                self.calls.append(("success", delivery_id, kwargs))
+                if delivery_id == "preleased-0":
+                    raise RuntimeError("database unavailable")
+
+        repository = FailingOutbox([])
+        wakeup = OutboxWakeup()
+        worker = AlertDeliveryWorker(
+            repository,
+            Sender(DeliveryAttempt(True, 204)),
+            concurrency=2,
+            wakeup=wakeup,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id=f"target-{index}")
+            for index in range(4)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await worker._drain(preleased=deliveries)
+
+        self.assertEqual(
+            {
+                delivery.delivery_id
+                for delivery in wakeup.take_preleased()
+            },
+            {"preleased-0", "preleased-2", "preleased-3"},
+        )
+
+    async def test_cancelled_prelease_drain_releases_all_outstanding_rows(self):
+        class ReleasingOutbox(EmptyOutbox):
+            def __init__(self):
+                super().__init__([])
+                self.released = ()
+
+            async def release_preleases(self, delivery_ids):
+                self.released = tuple(delivery_ids)
+
+        class BlockingSender:
+            def __init__(self):
+                self.started = asyncio.Event()
+
+            async def send(self, _delivery):
+                self.started.set()
+                await asyncio.Event().wait()
+
+        repository = ReleasingOutbox()
+        sender = BlockingSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=1,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id=f"target-{index}")
+            for index in range(3)
+        )
+        task = asyncio.create_task(worker._drain(preleased=deliveries))
+        await asyncio.wait_for(sender.started.wait(), timeout=0.2)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(
+            repository.released,
+            ("preleased-0", "preleased-1", "preleased-2"),
+        )
+
 
 class WakeupTests(unittest.IsolatedAsyncioTestCase):
     async def test_wakeup_coalesces_ids_and_notification_payloads(self):
@@ -368,6 +505,14 @@ class WakeupTests(unittest.IsolatedAsyncioTestCase):
         wakeup = OutboxWakeup()
         PostgresOutboxNotificationAdapter(wakeup).on_notification("not-json")
         self.assertEqual(await wakeup.wait(), ("not-json",))
+
+    async def test_preleased_deliveries_are_deduplicated_by_delivery_id(self):
+        wakeup = OutboxWakeup()
+        first = row(delivery_id="preleased")
+        duplicate = row(delivery_id="preleased")
+        wakeup.wake_preleased((first, duplicate))
+        self.assertEqual(wakeup.take_preleased(), (first,))
+        self.assertIsNone(wakeup.pop_wake_time("preleased"))
 
 
 class GenericSenderTests(unittest.IsolatedAsyncioTestCase):
