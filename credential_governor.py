@@ -51,6 +51,8 @@ class GovernorSnapshot:
     consecutive_429: int
     success_streak: int
     half_open_pending: bool
+    recovery_floor_seconds: float
+    last_rate_limited_at: float
 
 
 class CredentialGovernor(Protocol):
@@ -71,6 +73,16 @@ class CredentialGovernor(Protocol):
         retry_after_seconds: Optional[float] = None,
         owner_id: Optional[str] = None,
     ) -> GovernorSnapshot: ...
+    async def raise_interval_floor(
+        self, credential_key: str, interval_seconds: float
+    ) -> GovernorSnapshot: ...
+    async def set_interval_floor(
+        self,
+        credential_key: str,
+        interval_seconds: float,
+        *,
+        allow_lower: bool = False,
+    ) -> GovernorSnapshot: ...
 
 
 DEFAULT_INTERVAL_SECONDS = 5.0
@@ -79,6 +91,77 @@ MAX_429_COOLDOWN_SECONDS = 3600.0
 MAX_INTERVAL_SECONDS = 300.0
 RECOVERY_SUCCESS_COUNT = 120
 RECOVERY_DECREMENT_SECONDS = 0.25
+PRODUCTION_MIN_INTERVAL_SECONDS = 5.0
+CALIBRATION_VALIDITY_SECONDS = 24 * 60 * 60
+CALIBRATION_REQUIRED_OBSERVATIONS = 120
+
+
+@dataclass(frozen=True)
+class CalibrationKey:
+    """The route-specific identity of a safely calibrated request budget.
+
+    The credential hash remains the primary budget key.  Region, direct route,
+    and batch size are included because changing any of them changes the
+    observed load and latency envelope.  No raw credential material belongs in
+    this type.
+    """
+
+    credential_key: str
+    marketplace_id: str
+    region: str
+    direct_route: bool
+    batch_size: int
+
+    def __post_init__(self) -> None:
+        if not self.credential_key or not self.marketplace_id or not self.region:
+            raise ValueError("calibration key requires credential, marketplace, and region")
+        if not 1 <= int(self.batch_size) <= 20:
+            raise ValueError("calibration batch_size must be between 1 and 20")
+
+
+@dataclass(frozen=True)
+class CalibrationSnapshot:
+    key: CalibrationKey
+    interval_seconds: float
+    clean_observations: int
+    rate_limit_count: int
+    network_error_count: int
+    validated_at: float
+    invalidated_at: Optional[float] = None
+
+    def is_valid(self, now: float, validity_seconds: float = CALIBRATION_VALIDITY_SECONDS) -> bool:
+        return (
+            self.key.direct_route
+            and self.interval_seconds < PRODUCTION_MIN_INTERVAL_SECONDS
+            and self.clean_observations >= CALIBRATION_REQUIRED_OBSERVATIONS
+            and self.rate_limit_count == 0
+            and self.network_error_count == 0
+            and self.invalidated_at is None
+            and now >= self.validated_at
+            and now - self.validated_at <= float(validity_seconds)
+        )
+
+
+def production_interval_for_calibration(
+    requested_interval_seconds: float,
+    calibration: Optional[CalibrationSnapshot],
+    *,
+    now: float,
+    validity_seconds: float = CALIBRATION_VALIDITY_SECONDS,
+) -> float:
+    """Fail closed to the five-second production floor without a valid record."""
+    requested = float(requested_interval_seconds)
+    if requested >= PRODUCTION_MIN_INTERVAL_SECONDS:
+        return requested
+    if (
+        calibration is not None
+        and calibration.is_valid(now, validity_seconds)
+        # A calibration at 1 second may safely authorize 2 seconds, but must
+        # never be reused to increase pressure at 0.5 seconds.
+        and requested >= calibration.interval_seconds
+    ):
+        return requested
+    return PRODUCTION_MIN_INTERVAL_SECONDS
 
 
 def stable_credential_key(credential_material: str, salt: str = "") -> str:
@@ -99,6 +182,7 @@ def stable_credential_key(credential_material: str, salt: str = "") -> str:
 @dataclass
 class _State:
     interval_seconds: float
+    recovery_floor_seconds: float = DEFAULT_INTERVAL_SECONDS
     next_request_at: float = 0.0
     blocked_until: float = 0.0
     generation: int = 0
@@ -107,6 +191,7 @@ class _State:
     half_open_pending: bool = False
     lease_owner: Optional[str] = None
     lease_expires_at: float = 0.0
+    last_rate_limited_at: float = 0.0
 
 
 def _snapshot(key: str, state: _State) -> GovernorSnapshot:
@@ -119,6 +204,8 @@ def _snapshot(key: str, state: _State) -> GovernorSnapshot:
         consecutive_429=state.consecutive_429,
         success_streak=state.success_streak,
         half_open_pending=state.half_open_pending,
+        recovery_floor_seconds=state.recovery_floor_seconds,
+        last_rate_limited_at=state.last_rate_limited_at,
     )
 
 
@@ -156,7 +243,6 @@ def _record(
     status: Optional[int],
     retry_after_seconds: Optional[float],
     now: float,
-    base_interval: float,
     cooldown_seconds: float,
     max_cooldown_seconds: float,
     max_interval_seconds: float,
@@ -169,6 +255,11 @@ def _record(
         return _snapshot(key, state)
 
     if status == 429:
+        state.last_rate_limited_at = max(state.last_rate_limited_at, now)
+        state.recovery_floor_seconds = max(
+            state.recovery_floor_seconds,
+            PRODUCTION_MIN_INTERVAL_SECONDS,
+        )
         state.consecutive_429 += 1
         state.success_streak = 0
         state.interval_seconds = min(
@@ -192,11 +283,12 @@ def _record(
 
     if status is not None and 200 <= status < 300 and permit.request_class is RequestClass.POLL:
         state.consecutive_429 = 0
-        if state.interval_seconds > base_interval:
+        recovery_floor = state.recovery_floor_seconds
+        if state.interval_seconds > recovery_floor:
             state.success_streak += 1
             if state.success_streak >= recovery_success_count:
                 state.interval_seconds = max(
-                    base_interval,
+                    recovery_floor,
                     state.interval_seconds - recovery_decrement_seconds,
                 )
                 state.success_streak = 0
@@ -229,7 +321,13 @@ class InMemoryCredentialGovernor:
         self._lock = asyncio.Lock()
 
     def _state(self, key: str) -> _State:
-        return self._states.setdefault(key, _State(interval_seconds=self._base_interval))
+        return self._states.setdefault(
+            key,
+            _State(
+                interval_seconds=self._base_interval,
+                recovery_floor_seconds=self._base_interval,
+            ),
+        )
 
     async def acquire_leader(self, credential_key: str, owner_id: str, ttl_seconds: float) -> bool:
         async with self._lock:
@@ -299,7 +397,6 @@ class InMemoryCredentialGovernor:
                 status,
                 retry_after_seconds,
                 self._clock(),
-                self._base_interval,
                 self._cooldown_seconds,
                 self._max_cooldown_seconds,
                 self._max_interval_seconds,
@@ -310,6 +407,37 @@ class InMemoryCredentialGovernor:
     async def snapshot(self, credential_key: str) -> GovernorSnapshot:
         async with self._lock:
             return _snapshot(credential_key, self._state(credential_key))
+
+    async def raise_interval_floor(
+        self, credential_key: str, interval_seconds: float
+    ) -> GovernorSnapshot:
+        return await self.set_interval_floor(
+            credential_key, interval_seconds, allow_lower=False
+        )
+
+    async def set_interval_floor(
+        self,
+        credential_key: str,
+        interval_seconds: float,
+        *,
+        allow_lower: bool = False,
+    ) -> GovernorSnapshot:
+        floor = float(interval_seconds)
+        async with self._lock:
+            self._base_interval = (
+                floor if allow_lower else max(self._base_interval, floor)
+            )
+            state = self._state(credential_key)
+            if allow_lower:
+                state.recovery_floor_seconds = floor
+                state.interval_seconds = floor
+                state.success_streak = 0
+            else:
+                state.recovery_floor_seconds = max(
+                    state.recovery_floor_seconds, floor
+                )
+                state.interval_seconds = max(state.interval_seconds, floor)
+            return _snapshot(credential_key, state)
 
 
 SCHEMA_SQL = """
@@ -323,9 +451,235 @@ CREATE TABLE IF NOT EXISTS credential_governor (
     success_streak INTEGER NOT NULL,
     half_open_pending BOOLEAN NOT NULL,
     lease_owner TEXT,
-    lease_expires_at DOUBLE PRECISION NOT NULL
+    lease_expires_at DOUBLE PRECISION NOT NULL,
+    recovery_floor_seconds DOUBLE PRECISION NOT NULL DEFAULT 5,
+    last_rate_limited_at DOUBLE PRECISION NOT NULL DEFAULT 0
 )
 """
+
+
+CALIBRATION_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS credential_cadence_calibrations (
+    credential_key TEXT NOT NULL,
+    marketplace_id TEXT NOT NULL,
+    region TEXT NOT NULL,
+    direct_route BOOLEAN NOT NULL,
+    batch_size INTEGER NOT NULL CHECK (batch_size BETWEEN 1 AND 20),
+    interval_seconds DOUBLE PRECISION NOT NULL CHECK (interval_seconds > 0),
+    clean_observations INTEGER NOT NULL DEFAULT 0,
+    rate_limit_count INTEGER NOT NULL DEFAULT 0,
+    network_error_count INTEGER NOT NULL DEFAULT 0,
+    validated_at DOUBLE PRECISION NOT NULL,
+    invalidated_at DOUBLE PRECISION,
+    PRIMARY KEY (credential_key, marketplace_id, region, direct_route, batch_size)
+)
+"""
+
+
+class InMemoryCadenceCalibrationStore:
+    """Small deterministic calibration authority used by focused tests."""
+
+    def __init__(self, clock: Callable[[], float] = time.time):
+        self._clock = clock
+        self._records: dict[CalibrationKey, CalibrationSnapshot] = {}
+
+    async def load(self, key: CalibrationKey) -> Optional[CalibrationSnapshot]:
+        return self._records.get(key)
+
+    async def record_validation(
+        self,
+        key: CalibrationKey,
+        interval_seconds: float,
+        clean_observations: int,
+        rate_limit_count: int = 0,
+        network_error_count: int = 0,
+        *,
+        validated_at: Optional[float] = None,
+    ) -> CalibrationSnapshot:
+        snapshot = CalibrationSnapshot(
+            key=key,
+            interval_seconds=float(interval_seconds),
+            clean_observations=int(clean_observations),
+            rate_limit_count=int(rate_limit_count),
+            network_error_count=int(network_error_count),
+            validated_at=self._clock() if validated_at is None else float(validated_at),
+        )
+        self._records[key] = snapshot
+        return snapshot
+
+    async def invalidate_credential(
+        self, credential_key: str, marketplace_id: str, *, now: Optional[float] = None
+    ) -> int:
+        invalidated_at = self._clock() if now is None else float(now)
+        changed = 0
+        for key, value in tuple(self._records.items()):
+            if key.credential_key == credential_key and key.marketplace_id == marketplace_id:
+                self._records[key] = CalibrationSnapshot(
+                    **{**value.__dict__, "invalidated_at": invalidated_at}
+                )
+                changed += 1
+        return changed
+
+
+class PostgresCadenceCalibrationStore:
+    """Durable calibration records; callers retain production lease control."""
+
+    def __init__(self, pool, clock: Callable[[], float] = time.time):
+        self._pool = pool
+        self._clock = clock
+
+    async def initialize(self) -> None:
+        async with self._pool.acquire() as connection:
+            await connection.execute(CALIBRATION_SCHEMA_SQL)
+
+    @staticmethod
+    def _snapshot(row) -> CalibrationSnapshot:
+        key = CalibrationKey(
+            credential_key=row["credential_key"], marketplace_id=row["marketplace_id"],
+            region=row["region"], direct_route=bool(row["direct_route"]),
+            batch_size=int(row["batch_size"]),
+        )
+        return CalibrationSnapshot(
+            key=key, interval_seconds=float(row["interval_seconds"]),
+            clean_observations=int(row["clean_observations"]),
+            rate_limit_count=int(row["rate_limit_count"]),
+            network_error_count=int(row["network_error_count"]),
+            validated_at=float(row["validated_at"]),
+            invalidated_at=(None if row["invalidated_at"] is None else float(row["invalidated_at"])),
+        )
+
+    async def load(self, key: CalibrationKey) -> Optional[CalibrationSnapshot]:
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                "SELECT * FROM credential_cadence_calibrations WHERE credential_key=$1 AND marketplace_id=$2 AND region=$3 AND direct_route=$4 AND batch_size=$5",
+                key.credential_key, key.marketplace_id, key.region, key.direct_route, key.batch_size,
+            )
+        return None if row is None else self._snapshot(row)
+
+    async def record_validation(
+        self, key: CalibrationKey, interval_seconds: float, clean_observations: int,
+        rate_limit_count: int = 0, network_error_count: int = 0, *,
+        validated_at: Optional[float] = None,
+    ) -> CalibrationSnapshot:
+        validated = self._clock() if validated_at is None else float(validated_at)
+        async with self._pool.acquire() as connection:
+            row = await connection.fetchrow(
+                """INSERT INTO credential_cadence_calibrations
+                (credential_key, marketplace_id, region, direct_route, batch_size, interval_seconds,
+                 clean_observations, rate_limit_count, network_error_count, validated_at, invalidated_at)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,NULL)
+                ON CONFLICT (credential_key, marketplace_id, region, direct_route, batch_size) DO UPDATE SET
+                  interval_seconds=EXCLUDED.interval_seconds, clean_observations=EXCLUDED.clean_observations,
+                  rate_limit_count=EXCLUDED.rate_limit_count, network_error_count=EXCLUDED.network_error_count,
+                  validated_at=EXCLUDED.validated_at, invalidated_at=NULL
+                RETURNING *""",
+                key.credential_key, key.marketplace_id, key.region, key.direct_route, key.batch_size,
+                float(interval_seconds), int(clean_observations), int(rate_limit_count),
+                int(network_error_count), validated,
+            )
+        return self._snapshot(row)
+
+    async def invalidate_credential(
+        self, credential_key: str, marketplace_id: str, *, now: Optional[float] = None
+    ) -> int:
+        invalidated = self._clock() if now is None else float(now)
+        async with self._pool.acquire() as connection:
+            result = await connection.execute(
+                "UPDATE credential_cadence_calibrations SET invalidated_at=$3 WHERE credential_key=$1 AND marketplace_id=$2 AND invalidated_at IS NULL",
+                credential_key, marketplace_id, invalidated,
+            )
+        return int(str(result).rsplit(" ", 1)[-1])
+
+    async def activate_for_leader(
+        self,
+        key: CalibrationKey,
+        requested_interval_seconds: float,
+        owner_id: str,
+        *,
+        validity_seconds: float = CALIBRATION_VALIDITY_SECONDS,
+    ) -> tuple[float, Optional[float]]:
+        """Atomically bind a fresh calibration to the current poll leader."""
+        requested = float(requested_interval_seconds)
+        async with self._pool.acquire() as connection:
+            async with connection.transaction():
+                governor = await connection.fetchrow(
+                    """
+                    SELECT recovery_floor_seconds, last_rate_limited_at
+                    FROM credential_governor
+                    WHERE credential_key=$1
+                      AND lease_owner=$2
+                      AND lease_expires_at
+                          > EXTRACT(EPOCH FROM clock_timestamp())
+                    FOR UPDATE
+                    """,
+                    key.credential_key,
+                    owner_id,
+                )
+                if governor is None:
+                    raise CredentialLeaseFenceLost(
+                        "TVSS credential leader lease is no longer held"
+                    )
+                calibration = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM credential_cadence_calibrations
+                    WHERE credential_key=$1
+                      AND marketplace_id=$2
+                      AND region=$3
+                      AND direct_route=$4
+                      AND batch_size=$5
+                    FOR UPDATE
+                    """,
+                    key.credential_key,
+                    key.marketplace_id,
+                    key.region,
+                    key.direct_route,
+                    key.batch_size,
+                )
+                now = self._clock()
+                snapshot = (
+                    None
+                    if calibration is None
+                    else self._snapshot(calibration)
+                )
+                valid = (
+                    requested < PRODUCTION_MIN_INTERVAL_SECONDS
+                    and snapshot is not None
+                    and snapshot.is_valid(now, validity_seconds)
+                    and requested >= snapshot.interval_seconds
+                    and snapshot.validated_at
+                        > float(governor["last_rate_limited_at"])
+                )
+                effective = (
+                    requested
+                    if valid or requested >= PRODUCTION_MIN_INTERVAL_SECONDS
+                    else PRODUCTION_MIN_INTERVAL_SECONDS
+                )
+                await connection.execute(
+                    """
+                    UPDATE credential_governor
+                    SET recovery_floor_seconds=$2,
+                        interval_seconds=CASE
+                            WHEN $3::boolean
+                            THEN $2
+                            ELSE GREATEST(interval_seconds, $2)
+                        END,
+                        success_streak=CASE
+                            WHEN $3::boolean THEN 0
+                            ELSE success_streak
+                        END
+                    WHERE credential_key=$1
+                    """,
+                    key.credential_key,
+                    effective,
+                    valid,
+                )
+        age = (
+            max(0.0, now - snapshot.validated_at)
+            if snapshot is not None
+            else None
+        )
+        return effective, age
 
 
 class PostgresCredentialGovernor:
@@ -372,7 +726,7 @@ class PostgresCredentialGovernor:
                     # replicas.  Let the unique key elect the creator, then
                     # lock whichever row won before reading or mutating it.
                     await connection.execute(
-                        "INSERT INTO credential_governor (credential_key, interval_seconds, next_request_at, blocked_until, generation, consecutive_429, success_streak, half_open_pending, lease_expires_at) VALUES ($1, $2, 0, 0, 0, 0, 0, FALSE, 0) ON CONFLICT (credential_key) DO NOTHING",
+                        "INSERT INTO credential_governor (credential_key, interval_seconds, next_request_at, blocked_until, generation, consecutive_429, success_streak, half_open_pending, lease_expires_at, recovery_floor_seconds, last_rate_limited_at) VALUES ($1, $2, 0, 0, 0, 0, 0, FALSE, 0, $2, 0) ON CONFLICT (credential_key) DO NOTHING",
                         credential_key, self._base_interval,
                     )
                     row = await connection.fetchrow(
@@ -384,13 +738,17 @@ class PostgresCredentialGovernor:
                     consecutive_429=int(row["consecutive_429"]), success_streak=int(row["success_streak"]),
                     half_open_pending=bool(row["half_open_pending"]), lease_owner=row["lease_owner"],
                     lease_expires_at=float(row["lease_expires_at"]),
+                    recovery_floor_seconds=float(row["recovery_floor_seconds"]),
+                    last_rate_limited_at=float(row["last_rate_limited_at"]),
                 )
                 yield connection, state
                 await connection.execute(
-                    "UPDATE credential_governor SET interval_seconds=$2, next_request_at=$3, blocked_until=$4, generation=$5, consecutive_429=$6, success_streak=$7, half_open_pending=$8, lease_owner=$9, lease_expires_at=$10 WHERE credential_key=$1",
+                    "UPDATE credential_governor SET interval_seconds=$2, next_request_at=$3, blocked_until=$4, generation=$5, consecutive_429=$6, success_streak=$7, half_open_pending=$8, lease_owner=$9, lease_expires_at=$10, recovery_floor_seconds=$11, last_rate_limited_at=$12 WHERE credential_key=$1",
                     credential_key, state.interval_seconds, state.next_request_at, state.blocked_until,
                     state.generation, state.consecutive_429, state.success_streak, state.half_open_pending,
                     state.lease_owner, state.lease_expires_at,
+                    state.recovery_floor_seconds,
+                    state.last_rate_limited_at,
                 )
 
     async def acquire_leader(self, credential_key: str, owner_id: str, ttl_seconds: float) -> bool:
@@ -457,7 +815,6 @@ class PostgresCredentialGovernor:
                 status,
                 retry_after_seconds,
                 self._clock(),
-                self._base_interval,
                 self._cooldown_seconds,
                 self._max_cooldown_seconds,
                 self._max_interval_seconds,
@@ -467,6 +824,36 @@ class PostgresCredentialGovernor:
 
     async def snapshot(self, credential_key: str) -> GovernorSnapshot:
         async with self._locked_state(credential_key) as (_, state):
+            return _snapshot(credential_key, state)
+
+    async def raise_interval_floor(
+        self, credential_key: str, interval_seconds: float
+    ) -> GovernorSnapshot:
+        return await self.set_interval_floor(
+            credential_key, interval_seconds, allow_lower=False
+        )
+
+    async def set_interval_floor(
+        self,
+        credential_key: str,
+        interval_seconds: float,
+        *,
+        allow_lower: bool = False,
+    ) -> GovernorSnapshot:
+        floor = float(interval_seconds)
+        self._base_interval = (
+            floor if allow_lower else max(self._base_interval, floor)
+        )
+        async with self._locked_state(credential_key) as (_, state):
+            if allow_lower:
+                state.recovery_floor_seconds = floor
+                state.interval_seconds = floor
+                state.success_streak = 0
+            else:
+                state.recovery_floor_seconds = max(
+                    state.recovery_floor_seconds, floor
+                )
+                state.interval_seconds = max(state.interval_seconds, floor)
             return _snapshot(credential_key, state)
 
 

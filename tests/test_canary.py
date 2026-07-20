@@ -2,7 +2,13 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from cadence_canary import advance_deadline, run_bucket, validate
+from cadence_canary import (
+    advance_deadline,
+    calibration_summary,
+    run_bucket,
+    validate,
+)
+from credential_governor import CalibrationKey
 
 
 class DeadlineSchedulingTests(unittest.TestCase):
@@ -61,3 +67,32 @@ class FirstRateLimitStopsTests(unittest.TestCase):
 
         self.assertEqual(result["outcome"], "rate_limited")
         self.assertEqual(result["observations"], 1)
+
+
+class CalibrationOutputTests(unittest.TestCase):
+    def test_machine_readable_summary_requires_complete_clean_direct_validation(self):
+        key = CalibrationKey(
+            credential_key="tvss-opaque", marketplace_id="market",
+            region="us-west", direct_route=True, batch_size=20,
+        )
+        summary = calibration_summary(key, {
+            "interval_seconds": 0.5,
+            "outcome": "clean",
+            "observations": 120,
+        }, validated_at=100)
+        self.assertTrue(summary["valid"])
+        self.assertNotIn("private", summary["credential_hash"])
+        self.assertTrue(summary["direct_route"])
+
+    def test_rate_limited_summary_is_not_valid(self):
+        key = CalibrationKey(
+            credential_key="tvss-opaque", marketplace_id="market",
+            region="us-west", direct_route=True, batch_size=1,
+        )
+        summary = calibration_summary(key, {
+            "interval_seconds": 0.5,
+            "outcome": "rate_limited",
+            "observations": 119,
+        }, validated_at=100)
+        self.assertFalse(summary["valid"])
+        self.assertEqual(summary["rate_limit_count"], 1)

@@ -12,6 +12,13 @@ import aiohttp
 from dotenv import load_dotenv
 
 from amazon_tvss import TVSSClient, TVSSConfigError, TVSSRateLimitError
+from credential_governor import (
+    CALIBRATION_REQUIRED_OBSERVATIONS,
+    CalibrationKey,
+    CalibrationSnapshot,
+    PostgresCadenceCalibrationStore,
+    stable_credential_key,
+)
 from durable_runtime import exclusive_canary_lease
 
 
@@ -20,9 +27,10 @@ load_dotenv("endpoint.env")
 INTERVALS = (5.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5)
 DISCOVERY_SECONDS = 60.0
 QUIET_SECONDS = 900.0
-VALIDATION_OBSERVATIONS = 60
+VALIDATION_OBSERVATIONS = CALIBRATION_REQUIRED_OBSERVATIONS
 DIRECT_P50_BASELINE_MS = 109.0
 MAX_P50_MS = DIRECT_P50_BASELINE_MS * 1.10
+MAX_P95_MS = 223.7
 
 
 def parse_asins(raw_value):
@@ -38,6 +46,61 @@ def percentile(values, percentile_value):
     ordered = sorted(values)
     index = round((percentile_value / 100.0) * (len(ordered) - 1))
     return ordered[max(0, min(len(ordered) - 1, index))]
+
+
+def calibration_key_for_client(client, asins, env=None):
+    """Build a non-secret, route-bound calibration key for a direct canary."""
+    env = os.environ if env is None else env
+    configured_id = str(env.get("TVSS_CREDENTIAL_ID", "")).strip()
+    identity = configured_id or client.device_udid
+    if not identity or (not configured_id and not client.has_stable_device_identity):
+        raise TVSSConfigError(
+            "TVSS_CREDENTIAL_ID or a stable TVSS device identity is required"
+        )
+    return CalibrationKey(
+        credential_key=stable_credential_key(
+            f"{client.marketplace_id}:{identity}",
+            salt=str(env.get("TVSS_CREDENTIAL_SALT", "")),
+        ),
+        marketplace_id=client.marketplace_id,
+        region=str(env.get("RAILWAY_REPLICA_REGION", "local")),
+        direct_route=True,
+        batch_size=len(asins),
+    )
+
+
+def calibration_summary(key, validation, *, validated_at=None):
+    """Return a JSON-safe record central runtime wiring can persist verbatim."""
+    snapshot = CalibrationSnapshot(
+        key=key,
+        interval_seconds=float(validation["interval_seconds"]),
+        clean_observations=int(validation["observations"]),
+        rate_limit_count=int(validation["outcome"] == "rate_limited"),
+        network_error_count=int(validation["outcome"] == "error"),
+        validated_at=time.time() if validated_at is None else float(validated_at),
+    )
+    return {
+        "credential_hash": key.credential_key,
+        "marketplace_id": key.marketplace_id,
+        "region": key.region,
+        "direct_route": key.direct_route,
+        "batch_size": key.batch_size,
+        "interval_seconds": snapshot.interval_seconds,
+        "clean_observations": snapshot.clean_observations,
+        "rate_limit_count": snapshot.rate_limit_count,
+        "network_error_count": snapshot.network_error_count,
+        "valid": snapshot.is_valid(snapshot.validated_at),
+    }
+
+
+def enforce_direct_route(client):
+    """Disable both recovery and network-failure proxy fallback for a canary."""
+    client.disable_proxy_fallback()
+    client.proxy_pool.allow_network_fallback = False
+    if not client.proxy_pool.primary_route.is_direct:
+        raise TVSSConfigError(
+            "cadence calibration requires direct TVSS routing; set PROXY_MODE=fallback or direct"
+        )
 
 
 async def sleep_until(deadline):
@@ -124,11 +187,15 @@ async def validate(client, session, asins, interval, observations):
     }
 
 
-async def _run_canary(args, client):
+async def _run_canary(args, client, calibration_store=None):
     asins = parse_asins(args.asins)
     if not asins:
         raise TVSSConfigError("at least one valid ASIN is required")
 
+    # Calibration is direct-only.  Proxies must not create a separate request
+    # budget or be used to validate a production sub-five-second cadence.
+    enforce_direct_route(client)
+    calibration_key = calibration_key_for_client(client, asins)
     connector = aiohttp.TCPConnector(
         limit=0,
         ttl_dns_cache=300,
@@ -148,7 +215,22 @@ async def _run_canary(args, client):
             discovery.append(result)
             print(json.dumps({"stage": "discovery", **result}, sort_keys=True))
             if result["outcome"] == "rate_limited":
-                break
+                if calibration_store is not None:
+                    await calibration_store.invalidate_credential(
+                        calibration_key.credential_key,
+                        calibration_key.marketplace_id,
+                    )
+                print(
+                    json.dumps(
+                        {
+                            "stage": "summary",
+                            "accepted": False,
+                            "reason": "rate limit invalidated calibration",
+                        },
+                        sort_keys=True,
+                    )
+                )
+                return 1
 
         clean = [row for row in discovery if row["outcome"] == "clean"]
         if not clean:
@@ -193,20 +275,28 @@ async def _run_canary(args, client):
                     sort_keys=True,
                 )
             )
+            if validation["outcome"] == "rate_limited":
+                if calibration_store is not None:
+                    await calibration_store.invalidate_credential(
+                        calibration_key.credential_key,
+                        calibration_key.marketplace_id,
+                    )
+                break
             if validation["outcome"] == "clean":
                 break
-            if validation["outcome"] != "rate_limited":
-                break
-            slower_intervals = [
-                interval for interval in INTERVALS if interval > selected
-            ]
-            selected = min(slower_intervals) if slower_intervals else None
+            break
 
     accepted = (
         selected is not None
         and validation["outcome"] == "clean"
         and validation["observations"] == args.validation_observations
+        and args.validation_observations >= CALIBRATION_REQUIRED_OBSERVATIONS
         and validation["p50_ms"] <= MAX_P50_MS
+        and validation["p95_ms"] <= MAX_P95_MS
+        and all(
+            row["outcome"] == "clean"
+            for row in discovery + validation_history
+        )
     )
     summary = {
         "accepted": accepted,
@@ -220,8 +310,20 @@ async def _run_canary(args, client):
         "p50_ms": validation["p50_ms"],
         "p95_ms": validation["p95_ms"],
         "max_allowed_p50_ms": MAX_P50_MS,
+        "max_allowed_p95_ms": MAX_P95_MS,
+        "direct_route": True,
+        "calibration": calibration_summary(calibration_key, validation),
     }
     print(json.dumps({"stage": "summary", **summary}, sort_keys=True))
+    if calibration_store is not None:
+        if accepted:
+            await calibration_store.record_validation(
+                calibration_key,
+                validation["interval_seconds"],
+                validation["observations"],
+                rate_limit_count=0,
+                network_error_count=0,
+            )
     return 0 if accepted else 1
 
 
@@ -231,8 +333,12 @@ async def run(args):
         client,
         base_interval=min(INTERVALS),
         calibration=True,
-    ):
-        return await _run_canary(args, client)
+    ) as lease:
+        calibration_store = PostgresCadenceCalibrationStore(
+            lease["store"].pool
+        )
+        await calibration_store.initialize()
+        return await _run_canary(args, client, calibration_store)
 
 
 def main():

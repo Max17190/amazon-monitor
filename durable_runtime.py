@@ -6,7 +6,7 @@ import logging
 import os
 import signal
 import time
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
@@ -20,10 +20,13 @@ from discord import Embed, Webhook
 from alert_delivery import (
     AlertDelivery,
     AlertDeliveryWorker,
+    DeliveryStatus,
     DeliveryAttempt,
     DeliveryTarget,
     ErrorClass,
     GenericWebhookSender,
+    OutboxWakeup,
+    PostgresOutboxNotificationAdapter,
 )
 from amazon_tvss import (
     BatchObservation,
@@ -33,18 +36,24 @@ from amazon_tvss import (
     TVSSRateLimitError,
 )
 from credential_governor import (
+    CALIBRATION_VALIDITY_SECONDS,
+    CalibrationKey,
     CredentialLeaseFenceLost,
+    PostgresCadenceCalibrationStore,
     PostgresCredentialGovernor,
     new_owner_id,
     stable_credential_key,
 )
 from durable_store import (
     AlertWrite,
+    BatchCommitResult,
+    BatchStockDecision,
     PostgresStore,
     ScopeKey,
     StateConflict,
     TargetWrite,
     TransitionWrite,
+    VerificationWrite,
     connect_and_migrate,
 )
 from observability import DeliveryHealth, DeliveryMetrics, HealthStatus
@@ -62,12 +71,33 @@ from stock_state import (
 PRODUCTION_MIN_INTERVAL_SECONDS = 5.0
 DEFAULT_LEASE_TTL_SECONDS = 30.0
 DEFAULT_LEASE_RENEW_SECONDS = 10.0
-DEFAULT_VERIFICATION_TTL_SECONDS = 30.0
+# A fast-alert confirmation is intentionally deferred for up to twelve
+# successful five-second polls. Keep the default comfortably beyond that
+# window so the durable job can still be claimed when its slot arrives.
+DEFAULT_VERIFICATION_TTL_SECONDS = 90.0
 DEFAULT_METRICS_PORT = 9090
 
 
 class CredentialLeaseLost(RuntimeError):
     pass
+
+
+@dataclass
+class ConfirmationThrottle:
+    every_polls: int = 12
+    completed_polls: int = 0
+
+    def __post_init__(self):
+        self.every_polls = max(1, int(self.every_polls))
+
+    def note_poll(self):
+        self.completed_polls += 1
+
+    def due(self, fast_alert):
+        return not fast_alert or self.completed_polls >= self.every_polls
+
+    def consumed(self):
+        self.completed_polls = 0
 
 
 def _utc_now():
@@ -84,6 +114,12 @@ def _jsonable(value):
     if hasattr(value, "value"):
         return value.value
     return value
+
+
+def _json_mapping(value):
+    if isinstance(value, str):
+        value = json.loads(value)
+    return dict(value or {})
 
 
 def _scope_name(monitor_id, marketplace_id, asin, policy_hash):
@@ -103,15 +139,8 @@ def validate_durable_configuration(config, env=None):
     monitor_id = str(env.get("MONITOR_ID", "")).strip()
     if not monitor_id:
         raise TVSSConfigError("MONITOR_ID is required for durable monitor mode")
-    calibration = _parse_bool(env.get("TVSS_CALIBRATION_MODE"), False)
-    if (
-        config.poll_interval_seconds < PRODUCTION_MIN_INTERVAL_SECONDS
-        and not calibration
-    ):
-        raise TVSSConfigError(
-            "POLL_INTERVAL_SECONDS must be at least 5 in production; "
-            "use TVSS_CALIBRATION_MODE only for an exclusive canary"
-        )
+    if config.poll_interval_seconds <= 0:
+        raise TVSSConfigError("POLL_INTERVAL_SECONDS must be positive")
     lease_ttl = float(
         env.get("TVSS_LEADER_LEASE_SECONDS", DEFAULT_LEASE_TTL_SECONDS)
     )
@@ -157,6 +186,8 @@ class PostgresOutboxRepository:
         circuit_failure_threshold=5,
         circuit_open_seconds=60.0,
         dead_letter_retention_days=30,
+        metrics=None,
+        wakeup=None,
     ):
         self.store = store
         self.targets = targets
@@ -166,14 +197,30 @@ class PostgresOutboxRepository:
         self.circuit_failure_threshold = int(circuit_failure_threshold)
         self.circuit_open_seconds = float(circuit_open_seconds)
         self.dead_letter_retention_days = int(dead_letter_retention_days)
+        self.metrics = metrics
+        self.wakeup = wakeup
 
-    async def claim_due(self, *, limit, now, lease_seconds):
+    async def claim_due(
+        self,
+        *,
+        limit,
+        now,
+        lease_seconds,
+        preferred_delivery_ids=None,
+    ):
+        wake_times = {}
+        if self.wakeup is not None:
+            wake_times = {
+                str(value): self.wakeup.pop_wake_time(str(value))
+                for value in (preferred_delivery_ids or ())
+            }
         rows = await self.store.claim_deliveries(
             self.worker_id,
             limit=limit,
             lease_seconds=lease_seconds,
             global_limit=self.global_concurrency,
             per_target_limit=self.per_target_concurrency,
+            preferred_delivery_ids=preferred_delivery_ids,
         )
         claimed = []
         for row in rows:
@@ -191,7 +238,7 @@ class PostgresOutboxRepository:
                     delivery_id=str(row["delivery_id"]),
                     alert_id=str(row["alert_id"]),
                     target=target,
-                    payload=dict(row["payload"]),
+                    payload=_json_mapping(row["payload"]),
                     created_at=float(created_at),
                     attempts=max(0, int(row["attempts"]) - 1),
                     next_attempt_at=(
@@ -199,8 +246,19 @@ class PostgresOutboxRepository:
                         + float(row.get("previous_backoff_seconds") or 0.0)
                     ),
                     trace_context=row.get("trace_context"),
+                    claimed_at=time.time(),
                 )
             )
+            if self.metrics is not None:
+                woken_at = (
+                    wake_times.get(str(row["delivery_id"]))
+                )
+                if woken_at is not None:
+                    self.metrics.observe(
+                        "alert_wake_to_claim_seconds",
+                        max(0.0, time.time() - woken_at),
+                        labels={"target": row["target_id"]},
+                    )
         return claimed
 
     async def succeed(
@@ -210,11 +268,13 @@ class PostgresOutboxRepository:
         delivered_at,
         status_code,
         duration_seconds,
+        attempts,
     ):
         await self.store.mark_delivery_succeeded(
             UUID(delivery_id),
             duration_ms=float(duration_seconds) * 1000.0,
             remote_request_id=str(status_code) if status_code else None,
+            attempts=attempts,
         )
 
     async def retry(
@@ -240,6 +300,7 @@ class PostgresOutboxRepository:
             previous_backoff_seconds=delay,
             circuit_failure_threshold=self.circuit_failure_threshold,
             circuit_open_seconds=self.circuit_open_seconds,
+            attempts=attempts,
         )
 
     async def dead_letter(
@@ -259,6 +320,13 @@ class PostgresOutboxRepository:
             error_class=error_class.value,
             http_status=status_code,
             retention_days=self.dead_letter_retention_days,
+            attempts=attempts,
+        )
+
+    async def release_preleases(self, delivery_ids):
+        await self.store.release_preleased_deliveries(
+            self.worker_id,
+            delivery_ids,
         )
 
 
@@ -283,6 +351,11 @@ class DurableDeliverySender:
                 self.attempt_timeout_seconds
             ),
         )
+        self.discord_webhooks = {
+            target_id: Webhook.from_url(target.url, session=self.session)
+            for target_id, target in targets.items()
+            if target.kind == "discord"
+        }
 
     async def send(self, delivery):
         configured = self.targets.get(delivery.target.target_id)
@@ -299,9 +372,9 @@ class DurableDeliverySender:
         embed = self._discord_embed(delivery.payload)
         content = f"<@&{configured.role_id}>" if configured.role_id else None
         try:
-            webhook = Webhook.from_url(configured.url, session=self.session)
+            webhook = self.discord_webhooks[delivery.target.target_id]
             await asyncio.wait_for(
-                webhook.send(content=content, embed=embed, wait=True),
+                webhook.send(content=content, embed=embed, wait=False),
                 timeout=self.attempt_timeout_seconds,
             )
             return DeliveryAttempt(True, status_code=204)
@@ -523,6 +596,11 @@ class DurableStockCoordinator:
         asin_targets,
         metrics,
         tracer=None,
+        outbox_wakeup=None,
+        delivery_worker_id=None,
+        delivery_lease_seconds=30.0,
+        delivery_global_limit=32,
+        delivery_per_target_limit=2,
     ):
         self.store = store
         self.config = config
@@ -533,6 +611,16 @@ class DurableStockCoordinator:
         self.asin_targets = asin_targets
         self.metrics = metrics
         self.tracer = tracer
+        self.outbox_wakeup = outbox_wakeup
+        self.delivery_worker_id = delivery_worker_id
+        self.delivery_lease_seconds = float(delivery_lease_seconds)
+        self.delivery_global_limit = int(delivery_global_limit)
+        self.delivery_per_target_limit = int(delivery_per_target_limit)
+        self.targets_by_id = {
+            target.name: target
+            for targets in asin_targets.values()
+            for target in targets
+        }
         self.policy = SellerPolicy(
             require_amazon_seller=config.require_amazon_seller
         )
@@ -552,6 +640,33 @@ class DurableStockCoordinator:
             asin,
             self.policy.fingerprint,
         )
+
+    def confirmation_ttl_seconds(self):
+        """Return a confirmation TTL that survives the fast-alert cadence.
+
+        Fast alerts deliberately defer full-product requests. A configured
+        short TTL must not expire a job before its throttled request slot is
+        reached, while non-fast-alert monitors retain their configured TTL.
+        """
+        configured_ttl = float(
+            os.getenv(
+                "STOCK_CONFIRM_TTL_SECONDS",
+                str(DEFAULT_VERIFICATION_TTL_SECONDS),
+            )
+        )
+        if not self.config.fast_alert:
+            return configured_ttl
+        every_polls = max(
+            1,
+            int(os.getenv("FAST_ALERT_CONFIRM_EVERY_POLLS", "12")),
+        )
+        poll_interval = max(
+            float(self.config.poll_interval_seconds),
+            PRODUCTION_MIN_INTERVAL_SECONDS,
+        )
+        # Include one poll interval of scheduling and request-time slack.
+        minimum_ttl = (every_polls + 1) * poll_interval
+        return max(configured_ttl, minimum_ttl)
 
     async def process(
         self,
@@ -687,6 +802,15 @@ class DurableStockCoordinator:
                         "transition": str(transition is not None).lower(),
                     },
                 )
+                if persisted.get("delivery_ids") and self.outbox_wakeup is not None:
+                    wake_started = time.monotonic()
+                    self.outbox_wakeup.wake(
+                        str(value) for value in persisted["delivery_ids"]
+                    )
+                    self.metrics.observe(
+                        "alert_commit_to_wake_seconds",
+                        time.monotonic() - wake_started,
+                    )
                 if persisted["transition_created"]:
                     self.metrics.increment(
                         "stock_transition_total",
@@ -726,18 +850,246 @@ class DurableStockCoordinator:
                         scope,
                         evidence.sequence,
                         asdict(evidence),
-                        ttl_seconds=float(
-                            os.getenv(
-                                "STOCK_CONFIRM_TTL_SECONDS",
-                                str(DEFAULT_VERIFICATION_TTL_SECONDS),
-                            )
-                        ),
+                        ttl_seconds=self.confirmation_ttl_seconds(),
                     )
                 return decision
             except StateConflict:
                 self.metrics.increment("stock_state_conflict_total")
                 continue
         raise StateConflict("stock state changed repeatedly during observation")
+
+    async def process_batch(
+        self,
+        observations,
+        lease_credential_key=None,
+        lease_owner=None,
+    ):
+        """Classify a polling batch from one state snapshot and commit once.
+
+        ``observations`` is an iterable of ``(StockEvidence, product_data)``.
+        The return value preserves caller order and includes the typed commit
+        result used by the low-latency outbox path.
+        """
+        batch_started = time.monotonic()
+        entries = tuple(observations)
+        if not entries:
+            return (), BatchCommitResult({}, (), (), ())
+        scopes = [self.scope(product["asin"]) for _, product in entries]
+        if len(set(scopes)) != len(scopes):
+            raise ValueError("a batch may contain an ASIN only once")
+        rearm_count = int(os.getenv("STOCK_OOS_REARM_COUNT", "2"))
+        confirm_ttl = self.confirmation_ttl_seconds()
+        for _ in range(4):
+            stored_by_scope = await self.store.load_product_states(scopes)
+            prepared = []
+            # Buyable batch observations are evaluated first.  They do not
+            # depend on another ASIN, but ordering them first minimizes the
+            # time before a fast alert reaches the durable transaction.
+            indexed = list(enumerate(entries))
+            indexed.sort(
+                key=lambda item: not (
+                    item[1][0].source is EvidenceSource.BATCH
+                    and bool(item[1][0].offer_id)
+                )
+            )
+            results = [None] * len(entries)
+            for index, (evidence, product_data) in indexed:
+                scope = self.scope(product_data["asin"])
+                stored = stored_by_scope.get(scope)
+                expected_version = stored.get("version") if stored else None
+                if stored:
+                    state_payload = dict(stored)
+                    state_payload.pop("version", None)
+                    state_payload.pop("last_evidence", None)
+                    record = StockStateRecord.from_record(state_payload)
+                else:
+                    record = StockStateRecord(scope_key=evidence.scope_key)
+                decision = advance_state(
+                    record,
+                    evidence,
+                    self.policy,
+                    poll_interval=timedelta(seconds=self.config.poll_interval_seconds),
+                    oos_rearm_count=rearm_count,
+                )
+                results[index] = decision
+                self.metrics.increment(
+                    "stock_observation_total",
+                    labels={
+                        "source": evidence.source.value.lower(),
+                        "state": decision.classification.state.value.lower(),
+                        "decision": decision.kind.value.lower(),
+                    },
+                )
+                if not decision.accepted:
+                    continue
+                transition = None
+                alert = None
+                target_writes = ()
+                speculative = (
+                    self.config.fast_alert
+                    and evidence.source is EvidenceSource.BATCH
+                    and decision.classification.state is StockState.BUYABLE_UNCONFIRMED
+                    and record.armed_for_restock
+                )
+                if speculative:
+                    transition = TransitionWrite(
+                        transition_id=uuid4(),
+                        stock_epoch=record.epoch + 1,
+                        signal_type="offer_detected",
+                        confirmed=False,
+                        evidence_hash=decision.classification.evidence_hash,
+                        evidence=_jsonable(asdict(evidence)),
+                        detected_at=evidence.observed_at,
+                    )
+                    alert, target_writes = self._alert_writes(
+                        transition, product_data, confirmed=False
+                    )
+                elif decision.event is not None:
+                    event = decision.event
+                    transition = TransitionWrite(
+                        transition_id=UUID(event.transition_id),
+                        stock_epoch=event.epoch,
+                        signal_type="restock_confirmed",
+                        confirmed=True,
+                        evidence_hash=event.evidence_hash,
+                        evidence=_jsonable(asdict(evidence)),
+                        detected_at=event.opened_at,
+                    )
+                    alert, target_writes = self._alert_writes(
+                        transition, product_data, confirmed=True
+                    )
+                if alert is not None:
+                    # A batch-level span can be added by the caller without
+                    # changing the persistence contract.
+                    alert = replace(alert, trace_context=None)
+                verification = None
+                if (
+                    evidence.source is EvidenceSource.BATCH
+                    and decision.classification.state is StockState.BUYABLE_UNCONFIRMED
+                    and decision.previous_state is not StockState.IN_STOCK_CONFIRMED
+                ):
+                    verification = VerificationWrite(
+                        source_sequence=evidence.sequence,
+                        evidence=asdict(evidence),
+                        ttl_seconds=confirm_ttl,
+                    )
+                prepared.append(
+                    (index, transition, BatchStockDecision(
+                        scope=scope,
+                        state_record=decision.next_record.to_record(),
+                        expected_version=expected_version,
+                        evidence=asdict(evidence),
+                        transition=transition,
+                        alert=alert,
+                        targets=tuple(target_writes),
+                        verification=verification,
+                    ))
+                )
+            if not prepared:
+                return tuple(results), BatchCommitResult({}, (), (), ())
+            try:
+                persist_started = time.monotonic()
+                result = await self.store.commit_stock_decisions(
+                    [item[2] for item in prepared],
+                    lease_credential_key=lease_credential_key,
+                    lease_owner=lease_owner,
+                    prelease_worker_id=self.delivery_worker_id,
+                    prelease_lease_seconds=self.delivery_lease_seconds,
+                    prelease_global_limit=self.delivery_global_limit,
+                    prelease_per_target_limit=self.delivery_per_target_limit,
+                )
+                self.metrics.observe(
+                    "stock_response_to_commit_seconds",
+                    time.monotonic() - batch_started,
+                    labels={"batch_size": str(len(entries))},
+                )
+                self.metrics.observe(
+                    "alert_detect_to_persist_seconds",
+                    time.monotonic() - persist_started,
+                    labels={"source": "batch", "transition": str(bool(result.transition_ids)).lower()},
+                )
+                if result.delivery_ids and self.outbox_wakeup is not None:
+                    wake_started = time.monotonic()
+                    preleased = self._preleased_deliveries(
+                        prepared,
+                        result.preleased_delivery_ids,
+                    )
+                    if preleased:
+                        self.outbox_wakeup.wake_preleased(preleased)
+                    preleased_ids = {
+                        str(value) for value in result.preleased_delivery_ids
+                    }
+                    pending_ids = tuple(
+                        str(value)
+                        for value in result.delivery_ids
+                        if str(value) not in preleased_ids
+                    )
+                    if pending_ids:
+                        self.outbox_wakeup.wake(pending_ids)
+                    self.metrics.observe(
+                        "alert_commit_to_wake_seconds",
+                        time.monotonic() - wake_started,
+                    )
+                created = set(result.transition_ids)
+                for _, transition, _ in prepared:
+                    if transition is None:
+                        continue
+                    if transition.transition_id in created:
+                        self.metrics.increment(
+                            "stock_transition_total",
+                            labels={
+                                "signal": transition.signal_type,
+                                "confirmed": str(transition.confirmed).lower(),
+                            },
+                        )
+                    else:
+                        self.metrics.increment(
+                            "stock_transition_deduped_total",
+                            labels={"signal": transition.signal_type},
+                        )
+                return tuple(results), result
+            except StateConflict:
+                self.metrics.increment("stock_state_conflict_total")
+                continue
+        raise StateConflict("stock state changed repeatedly during batch observation")
+
+    def _preleased_deliveries(self, prepared, delivery_ids):
+        wanted = {str(value) for value in delivery_ids}
+        if not wanted:
+            return ()
+        claimed_at = time.time()
+        deliveries = []
+        for _, _, decision in prepared:
+            if decision.alert is None:
+                continue
+            payload = decision.alert.payload
+            for target_write in decision.targets:
+                delivery_id = str(target_write.delivery_id)
+                if delivery_id not in wanted:
+                    continue
+                configured = self.targets_by_id.get(target_write.target_id)
+                target = DeliveryTarget(
+                    target_id=target_write.target_id,
+                    url=configured.url if configured else "",
+                    kind=target_write.target_kind,
+                )
+                deliveries.append(
+                    AlertDelivery(
+                        delivery_id=delivery_id,
+                        alert_id=str(decision.alert.alert_id),
+                        target=target,
+                        payload=payload,
+                        created_at=claimed_at,
+                        attempts=0,
+                        leased_until=(
+                            claimed_at + self.delivery_lease_seconds
+                        ),
+                        status=DeliveryStatus.LEASED,
+                        trace_context=decision.alert.trace_context,
+                        claimed_at=claimed_at,
+                    )
+                )
+        return tuple(deliveries)
 
     def _alert_writes(self, transition, product_data, confirmed):
         alert_id = uuid4()
@@ -903,9 +1255,13 @@ async def _poll_credential(
     metrics,
     runtime_status,
     stop_event,
+    calibration_store=None,
 ):
     auth_failure_started = None
     auth_grace = float(os.getenv("AUTH_FAILURE_GRACE_SECONDS", "30"))
+    confirmation_throttle = ConfirmationThrottle(
+        os.getenv("FAST_ALERT_CONFIRM_EVERY_POLLS", "12")
+    )
     while not stop_event.is_set() and runtime_status.leader_owned:
         try:
             with trace_span(coordinator.tracer, "tvss.batch_poll"):
@@ -946,24 +1302,28 @@ async def _poll_credential(
                 )
             observed_at = _utc_now()
             sequence_base = time.time_ns()
-            for index, asin in enumerate(asins):
-                observation = batch[asin]
-                evidence = _batch_evidence(
-                    coordinator,
-                    asin,
-                    observation,
-                    sequence_base + index,
-                    observed_at,
+            observations = tuple(
+                (
+                    _batch_evidence(
+                        coordinator,
+                        asin,
+                        batch[asin],
+                        sequence_base + index,
+                        observed_at,
+                    ),
+                    _batch_product_payload(client, asin, batch[asin]),
                 )
-                await coordinator.process(
-                    evidence,
-                    _batch_product_payload(client, asin, observation),
-                    lease_credential_key=client.credential_key,
-                    lease_owner=client.credential_owner_id,
-                )
+                for index, asin in enumerate(asins)
+            )
+            await coordinator.process_batch(
+                observations,
+                lease_credential_key=client.credential_key,
+                lease_owner=client.credential_owner_id,
+            )
             runtime_status.last_poll_success_at = time.time()
             metrics.set_gauge("tvss_poll_freshness_seconds", 0.0)
             auth_failure_started = None
+            confirmation_throttle.note_poll()
         except CredentialLeaseFenceLost:
             # Do not accept a stale response or persist it after another
             # replica has acquired this credential.
@@ -971,9 +1331,25 @@ async def _poll_credential(
                 "TVSS credential lease was fenced during poll work"
             )
         except TVSSRateLimitError as exc:
+            if calibration_store is not None:
+                await calibration_store.invalidate_credential(
+                    client.credential_key, client.marketplace_id
+                )
+            snapshot = await client.durable_governor.raise_interval_floor(
+                client.credential_key, PRODUCTION_MIN_INTERVAL_SECONDS
+            )
+            coordinator.config = replace(
+                coordinator.config,
+                poll_interval_seconds=max(
+                    coordinator.config.poll_interval_seconds,
+                    PRODUCTION_MIN_INTERVAL_SECONDS,
+                ),
+            )
             metrics.increment("tvss_rate_limit_total")
-            snapshot = await client.durable_governor.snapshot(
-                client.credential_key
+            metrics.increment("tvss_calibration_invalidated_total")
+            metrics.set_gauge(
+                "tvss_effective_calibrated_interval_seconds",
+                coordinator.config.poll_interval_seconds,
             )
             metrics.set_gauge(
                 "tvss_credential_cooldown_seconds",
@@ -1018,6 +1394,8 @@ async def _poll_credential(
 
         if stop_event.is_set() or not runtime_status.leader_owned:
             break
+        if not confirmation_throttle.due(coordinator.config.fast_alert):
+            continue
         jobs = await store.claim_verification_jobs(
             worker_id,
             coordinator.monitor_id,
@@ -1033,6 +1411,7 @@ async def _poll_credential(
         )
         if not jobs:
             continue
+        confirmation_throttle.consumed()
         job = jobs[0]
         try:
             confirmation_started = time.monotonic()
@@ -1068,6 +1447,33 @@ async def _poll_credential(
             raise CredentialLeaseLost(
                 "TVSS credential lease was fenced during confirmation work"
             )
+        except TVSSRateLimitError:
+            if calibration_store is not None:
+                await calibration_store.invalidate_credential(
+                    client.credential_key, client.marketplace_id
+                )
+            await client.durable_governor.raise_interval_floor(
+                client.credential_key, PRODUCTION_MIN_INTERVAL_SECONDS
+            )
+            coordinator.config = replace(
+                coordinator.config,
+                poll_interval_seconds=max(
+                    coordinator.config.poll_interval_seconds,
+                    PRODUCTION_MIN_INTERVAL_SECONDS,
+                ),
+            )
+            metrics.increment("tvss_rate_limit_total")
+            metrics.increment("tvss_calibration_invalidated_total")
+            metrics.set_gauge(
+                "tvss_effective_calibrated_interval_seconds",
+                coordinator.config.poll_interval_seconds,
+            )
+            await store.finish_verification(
+                job["job_id"],
+                worker_id,
+                success=False,
+                retryable=True,
+            )
         except Exception:
             logging.exception(
                 "Full-product confirmation failed for ASIN %s", job["asin"]
@@ -1092,6 +1498,10 @@ async def _leader_supervisor(
     metrics,
     runtime_status,
     stop_event,
+    calibration_store=None,
+    calibration_key=None,
+    requested_interval_seconds=PRODUCTION_MIN_INTERVAL_SECONDS,
+    calibration_validity_seconds=CALIBRATION_VALIDITY_SECONDS,
 ):
     ttl = float(
         os.getenv("TVSS_LEADER_LEASE_SECONDS", str(DEFAULT_LEASE_TTL_SECONDS))
@@ -1103,6 +1513,44 @@ async def _leader_supervisor(
         )
     )
     poll_task = None
+    refresh_timeout = renew_every
+
+    async def refresh_interval():
+        nonlocal refresh_timeout
+        if calibration_store is None or calibration_key is None:
+            refresh_timeout = renew_every
+            return PRODUCTION_MIN_INTERVAL_SECONDS
+        interval, age = await calibration_store.activate_for_leader(
+            calibration_key,
+            requested_interval_seconds,
+            owner_id,
+            validity_seconds=calibration_validity_seconds,
+        )
+        coordinator.config = replace(
+            coordinator.config,
+            poll_interval_seconds=interval,
+        )
+        metrics.set_gauge(
+            "tvss_effective_calibrated_interval_seconds", interval
+        )
+        metrics.set_gauge(
+            "tvss_calibration_age_seconds",
+            age if age is not None else -1,
+        )
+        if interval < PRODUCTION_MIN_INTERVAL_SECONDS:
+            client.disable_proxy_fallback()
+            client.proxy_pool.allow_network_fallback = False
+            refresh_timeout = max(
+                0.05,
+                min(
+                    renew_every,
+                    calibration_validity_seconds - float(age or 0.0),
+                ),
+            )
+        else:
+            refresh_timeout = renew_every
+        return interval
+
     try:
         while not stop_event.is_set():
             if not runtime_status.leader_owned:
@@ -1110,6 +1558,7 @@ async def _leader_supervisor(
                     credential_key, owner_id, ttl
                 )
                 if acquired:
+                    await refresh_interval()
                     runtime_status.leader_owned = True
                     runtime_status.last_lease_renewal_at = time.time()
                     metrics.set_gauge("tvss_lease_state", 1)
@@ -1128,6 +1577,7 @@ async def _leader_supervisor(
                             metrics,
                             runtime_status,
                             stop_event,
+                            calibration_store,
                         ),
                         name="durable-tvss-poller",
                     )
@@ -1150,6 +1600,7 @@ async def _leader_supervisor(
                     )
                 else:
                     runtime_status.last_lease_renewal_at = time.time()
+                    await refresh_interval()
 
             if poll_task is not None and poll_task.done():
                 error = poll_task.exception()
@@ -1168,7 +1619,9 @@ async def _leader_supervisor(
                         "TVSS poll leader stopped unexpectedly"
                     )
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=renew_every)
+                await asyncio.wait_for(
+                    stop_event.wait(), timeout=refresh_timeout
+                )
             except asyncio.TimeoutError:
                 pass
     finally:
@@ -1202,6 +1655,131 @@ async def _maintenance_loop(store, metrics, stop_event):
             pass
 
 
+async def _outbox_notification_listener(
+    store,
+    wakeup,
+    stop_event,
+    reconnect_initial_seconds=1.0,
+    reconnect_max_seconds=30.0,
+    reconnect_wait=None,
+):
+    """Keep the outbox LISTEN subscription alive across connection loss."""
+    adapter = PostgresOutboxNotificationAdapter(wakeup)
+    reconnect_wait = reconnect_wait or _wait_for_stop
+    backoff = max(0.0, float(reconnect_initial_seconds))
+    max_backoff = max(backoff, float(reconnect_max_seconds))
+    while not stop_event.is_set():
+        connection_lost = asyncio.Event()
+        try:
+            async with store.pool.acquire() as connection:
+                listener_registered = False
+                termination_listener_registered = False
+
+                def receive(_connection, _pid, _channel, payload):
+                    adapter.on_notification(payload)
+
+                def connection_terminated(_connection):
+                    connection_lost.set()
+
+                try:
+                    await connection.add_listener(
+                        "alert_outbox_ready",
+                        receive,
+                    )
+                    listener_registered = True
+                    connection.add_termination_listener(connection_terminated)
+                    termination_listener_registered = True
+                    backoff = max(0.0, float(reconnect_initial_seconds))
+
+                    waiters = (
+                        asyncio.create_task(stop_event.wait()),
+                        asyncio.create_task(connection_lost.wait()),
+                    )
+                    try:
+                        await asyncio.wait(
+                            waiters,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for waiter in waiters:
+                            waiter.cancel()
+                        await asyncio.gather(
+                            *waiters,
+                            return_exceptions=True,
+                        )
+                finally:
+                    if listener_registered:
+                        with suppress(Exception):
+                            await connection.remove_listener(
+                                "alert_outbox_ready",
+                                receive,
+                            )
+                    if termination_listener_registered:
+                        with suppress(Exception):
+                            connection.remove_termination_listener(
+                                connection_terminated
+                            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if not stop_event.is_set():
+                logging.exception("Outbox notification listener disconnected")
+
+        if stop_event.is_set():
+            break
+        await reconnect_wait(stop_event, backoff)
+        backoff = min(max_backoff, max(0.001, backoff * 2))
+
+
+async def _wait_for_stop(stop_event, seconds):
+    """Wait for either a reconnect delay or a clean shutdown request."""
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
+async def _connection_warmer(session, targets, metrics, stop_event):
+    interval = float(os.getenv("ALERT_CONNECTION_WARM_SECONDS", "90"))
+    if interval <= 0:
+        return
+    urls = []
+    for target_id, target in targets.items():
+        if target.kind == "discord":
+            urls.append((target_id, target.url))
+            continue
+        warmup_url = str(
+            os.getenv(f"WEBHOOK_{target_id.upper()}_WARMUP_URL", "")
+        ).strip()
+        if warmup_url:
+            urls.append((target_id, warmup_url))
+    while not stop_event.is_set():
+        for target_id, url in urls:
+            started = time.monotonic()
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=3),
+                ) as response:
+                    response.release()
+                metrics.observe(
+                    "alert_connection_warm_seconds",
+                    time.monotonic() - started,
+                    labels={"target": target_id, "outcome": "response"},
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                metrics.increment(
+                    "alert_connection_warm_total",
+                    labels={"target": target_id, "outcome": "error"},
+                )
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_durable_monitor(config, webhook_targets):
     monitor_id = validate_durable_configuration(config)
     store = await connect_and_migrate(
@@ -1229,9 +1807,40 @@ async def run_durable_monitor(config, webhook_targets):
             salt=str(os.getenv("TVSS_CREDENTIAL_SALT", "")),
         )
         owner_id = new_owner_id()
+        all_asins = list(
+            dict.fromkeys(
+                asin for group in config.groups for asin in group.asins
+            )
+        )
+        if len(all_asins) > 20:
+            raise TVSSConfigError(
+                "durable batch monitor supports at most 20 unique ASINs"
+            )
+        calibration_store = PostgresCadenceCalibrationStore(store.pool)
+        await calibration_store.initialize()
+        calibration_key = CalibrationKey(
+            credential_key=credential_key,
+            marketplace_id=client.marketplace_id,
+            region=str(os.getenv("RAILWAY_REPLICA_REGION", "local")),
+            direct_route=bool(client.proxy_pool.primary_route.is_direct),
+            batch_size=len(all_asins),
+        )
+        calibration_validity_seconds = float(
+            os.getenv(
+                "TVSS_CALIBRATION_VALIDITY_SECONDS",
+                str(CALIBRATION_VALIDITY_SECONDS),
+            )
+        )
+        standby_interval = max(
+            config.poll_interval_seconds,
+            PRODUCTION_MIN_INTERVAL_SECONDS,
+        )
+        effective_config = replace(
+            config, poll_interval_seconds=standby_interval
+        )
         governor = PostgresCredentialGovernor(
             store.pool,
-            base_interval=config.poll_interval_seconds,
+            base_interval=standby_interval,
             cooldown_seconds=float(
                 os.getenv("TVSS_429_COOLDOWN_SECONDS", "900")
             ),
@@ -1251,25 +1860,30 @@ async def run_durable_monitor(config, webhook_targets):
         await governor.initialize()
         client.configure_durable_governor(governor, credential_key, owner_id)
 
-        all_asins = list(
-            dict.fromkeys(
-                asin for group in config.groups for asin in group.asins
-            )
-        )
-        if len(all_asins) > 20:
-            raise TVSSConfigError(
-                "durable batch monitor supports at most 20 unique ASINs"
-            )
         asin_groups, asin_targets = _build_group_maps(
             config, webhook_targets
         )
         metrics = DeliveryMetrics()
+        metrics.set_gauge(
+            "tvss_effective_calibrated_interval_seconds", standby_interval
+        )
+        metrics.set_gauge("tvss_calibration_age_seconds", -1)
         delivery_health = DeliveryHealth(repository_ready=True)
         runtime_status = RuntimeStatus()
         tracer = configure_tracing()
+        outbox_wakeup = OutboxWakeup()
+        worker_concurrency = int(
+            os.getenv("ALERT_WORKER_CONCURRENCY", "32")
+        )
+        target_concurrency = int(
+            os.getenv("ALERT_TARGET_CONCURRENCY", "2")
+        )
+        delivery_lease_seconds = float(
+            os.getenv("ALERT_LEASE_SECONDS", "30")
+        )
         coordinator = DurableStockCoordinator(
             store,
-            config,
+            effective_config,
             monitor_id,
             client.marketplace_id,
             client.domain,
@@ -1277,6 +1891,11 @@ async def run_durable_monitor(config, webhook_targets):
             asin_targets,
             metrics,
             tracer=tracer,
+            outbox_wakeup=outbox_wakeup,
+            delivery_worker_id=owner_id,
+            delivery_lease_seconds=delivery_lease_seconds,
+            delivery_global_limit=worker_concurrency,
+            delivery_per_target_limit=target_concurrency,
         )
         stop_event = asyncio.Event()
 
@@ -1293,19 +1912,22 @@ async def run_durable_monitor(config, webhook_targets):
             except NotImplementedError:
                 pass
 
-        connector = aiohttp.TCPConnector(
+        tvss_connector = aiohttp.TCPConnector(
             limit=0,
             ttl_dns_cache=300,
             keepalive_timeout=120,
             enable_cleanup_closed=True,
         )
-        async with aiohttp.ClientSession(connector=connector) as session:
-            worker_concurrency = int(
-                os.getenv("ALERT_WORKER_CONCURRENCY", "32")
-            )
-            target_concurrency = int(
-                os.getenv("ALERT_TARGET_CONCURRENCY", "2")
-            )
+        alert_connector = aiohttp.TCPConnector(
+            limit=0,
+            ttl_dns_cache=300,
+            keepalive_timeout=120,
+            enable_cleanup_closed=True,
+        )
+        async with (
+            aiohttp.ClientSession(connector=tvss_connector) as tvss_session,
+            aiohttp.ClientSession(connector=alert_connector) as alert_session,
+        ):
             circuit_failure_threshold = int(
                 os.getenv("ALERT_CIRCUIT_FAILURE_THRESHOLD", "5")
             )
@@ -1326,8 +1948,10 @@ async def run_durable_monitor(config, webhook_targets):
                         "30",
                     )
                 ),
+                metrics=metrics,
+                wakeup=outbox_wakeup,
             )
-            sender = DurableDeliverySender(session, webhook_targets)
+            sender = DurableDeliverySender(alert_session, webhook_targets)
             worker = AlertDeliveryWorker(
                 repository,
                 sender,
@@ -1335,9 +1959,7 @@ async def run_durable_monitor(config, webhook_targets):
                 health=delivery_health,
                 concurrency=worker_concurrency,
                 per_target_concurrency=target_concurrency,
-                lease_seconds=float(
-                    os.getenv("ALERT_LEASE_SECONDS", "30")
-                ),
+                lease_seconds=delivery_lease_seconds,
                 max_attempts=int(os.getenv("ALERT_MAX_ATTEMPTS", "10")),
                 max_age_seconds=float(
                     os.getenv("ALERT_MAX_AGE_SECONDS", "900")
@@ -1347,6 +1969,10 @@ async def run_durable_monitor(config, webhook_targets):
                 ),
                 circuit_failure_threshold=circuit_failure_threshold,
                 circuit_open_seconds=circuit_open_seconds,
+                wakeup=outbox_wakeup,
+                fallback_poll_seconds=float(
+                    os.getenv("ALERT_OUTBOX_FALLBACK_POLL_SECONDS", "1")
+                ),
             )
             operations = OperationsServer(
                 store,
@@ -1365,19 +1991,35 @@ async def run_durable_monitor(config, webhook_targets):
                     credential_key,
                     owner_id,
                     client,
-                    session,
+                    tvss_session,
                     store,
                     coordinator,
                     all_asins,
                     metrics,
                     runtime_status,
                     stop_event,
+                    calibration_store,
+                    calibration_key,
+                    config.poll_interval_seconds,
+                    calibration_validity_seconds,
                 ),
                 name="credential-leader-supervisor",
             )
             maintenance_task = asyncio.create_task(
                 _maintenance_loop(store, metrics, stop_event),
                 name="durable-maintenance",
+            )
+            notification_task = asyncio.create_task(
+                _outbox_notification_listener(
+                    store, outbox_wakeup, stop_event
+                ),
+                name="outbox-notification-listener",
+            )
+            warmer_task = asyncio.create_task(
+                _connection_warmer(
+                    alert_session, webhook_targets, metrics, stop_event
+                ),
+                name="alert-connection-warmer",
             )
             await stop_event.wait()
             runtime_status.stopping = True
@@ -1386,6 +2028,8 @@ async def run_durable_monitor(config, webhook_targets):
                 leader_task,
                 worker_task,
                 maintenance_task,
+                notification_task,
+                warmer_task,
                 return_exceptions=True,
             )
             for result in results:
@@ -1492,9 +2136,19 @@ async def exclusive_canary_lease(
         raise TVSSConfigError(
             "production or another canary currently owns this TVSS credential"
         )
+    await governor.set_interval_floor(
+        key,
+        base_interval,
+        allow_lower=calibration,
+    )
     client.configure_durable_governor(governor, key, owner_id)
     try:
-        yield
+        yield {
+            "store": store,
+            "governor": governor,
+            "credential_key": key,
+            "owner_id": owner_id,
+        }
     finally:
         await governor.release_leader(key, owner_id)
         await store.close()

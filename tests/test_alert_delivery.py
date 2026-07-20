@@ -6,7 +6,8 @@ import aiohttp
 
 from alert_delivery import (
     AlertDelivery, AlertDeliveryWorker, CircuitBreaker, DeliveryAttempt, DeliveryStatus, DeliveryTarget,
-    ErrorClass, GenericWebhookSender, classify_response, decorrelated_jitter, parse_retry_after,
+    ErrorClass, GenericWebhookSender, OutboxWakeup, PostgresOutboxNotificationAdapter,
+    classify_response, decorrelated_jitter, parse_retry_after,
 )
 from observability import DeliveryHealth, DeliveryMetrics, HealthStatus
 
@@ -31,6 +32,50 @@ class MemoryOutbox:
 class Sender:
     def __init__(self, result): self.result = result
     async def send(self, delivery): return self.result
+
+
+class RecordingSender(Sender):
+    def __init__(self, result):
+        super().__init__(result)
+        self.sent = asyncio.Event()
+
+    async def send(self, delivery):
+        self.sent.set()
+        return await super().send(delivery)
+
+
+class WakeupOutbox:
+    """Returns only explicitly preferred rows after the worker has gone idle."""
+
+    def __init__(self, rows):
+        self.rows = {item.delivery_id: item for item in rows}
+        self.calls = []
+        self.initial_scan = asyncio.Event()
+
+    async def claim_due(self, *, limit, now, lease_seconds, preferred_delivery_ids=None):
+        preferred = tuple(preferred_delivery_ids or ())
+        self.calls.append(preferred)
+        if not preferred:
+            self.initial_scan.set()
+            return []
+        claimed = [self.rows.pop(value) for value in preferred if value in self.rows]
+        return claimed[:limit]
+
+    async def succeed(self, *_args, **_kwargs): pass
+    async def retry(self, *_args, **_kwargs): pass
+    async def dead_letter(self, *_args, **_kwargs): pass
+
+
+class QueueOutbox(MemoryOutbox):
+    async def claim_due(self, *, limit, now, lease_seconds):
+        claimed, self.rows = self.rows[:limit], self.rows[limit:]
+        return claimed
+
+
+class EmptyOutbox(MemoryOutbox):
+    async def claim_due(self, *, limit, now, lease_seconds, **_kwargs):
+        self.calls.append(("claim", limit))
+        return []
 
 
 def row(*, attempts=0, created_at=100.0, delivery_id="delivery-1", target_id="discord-main"):
@@ -191,6 +236,283 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
             sum(call[0] == "success" for call in repository.calls),
             20,
         )
+
+    async def test_drain_consumes_all_due_rows_before_waiting(self):
+        repository = QueueOutbox([row(delivery_id="one"), row(delivery_id="two")])
+        worker = AlertDeliveryWorker(repository, Sender(DeliveryAttempt(True, 204)), clock=lambda: 110)
+        self.assertEqual(await worker._drain(), 2)
+        self.assertEqual(sum(call[0] == "success" for call in repository.calls), 2)
+
+    async def test_drain_prioritizes_wakeup_ids_arriving_during_backlog(self):
+        class BacklogOutbox:
+            def __init__(self):
+                self.rows = {
+                    "backlog-first": row(delivery_id="backlog-first"),
+                    "backlog-second": row(delivery_id="backlog-second"),
+                    "committed-one": row(delivery_id="committed-one"),
+                    "committed-two": row(delivery_id="committed-two"),
+                }
+                self.calls = []
+                self.first_claimed = asyncio.Event()
+
+            async def claim_due(self, *, limit, now, lease_seconds, preferred_delivery_ids=None):
+                preferred = tuple(preferred_delivery_ids or ())
+                self.calls.append(preferred)
+                if len(self.calls) == 1:
+                    self.first_claimed.set()
+                    return [self.rows.pop("backlog-first")]
+                for delivery_id in preferred:
+                    if delivery_id in self.rows:
+                        return [self.rows.pop(delivery_id)]
+                if self.rows:
+                    return [self.rows.pop(next(iter(self.rows)))]
+                return []
+
+            async def succeed(self, *_args, **_kwargs): pass
+            async def retry(self, *_args, **_kwargs): pass
+            async def dead_letter(self, *_args, **_kwargs): pass
+
+        class GateSender(Sender):
+            def __init__(self):
+                super().__init__(DeliveryAttempt(True, 204))
+                self.release = asyncio.Event()
+
+            async def send(self, delivery):
+                if delivery.delivery_id == "backlog-first":
+                    await self.release.wait()
+                return await super().send(delivery)
+
+        repository = BacklogOutbox()
+        sender = GateSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=1,
+            clock=lambda: 110,
+        )
+        task = asyncio.create_task(worker._drain())
+        await asyncio.wait_for(repository.first_claimed.wait(), timeout=0.2)
+        worker.wake(["committed-one", "committed-two"])
+        sender.release.set()
+
+        self.assertEqual(await asyncio.wait_for(task, timeout=0.2), 4)
+        self.assertEqual(
+            repository.calls[:4],
+            [(), ("committed-one",), ("committed-two",), ()],
+        )
+
+    async def test_drain_prunes_unclaimable_preferred_ids_during_backlog(self):
+        class StalePreferredOutbox:
+            def __init__(self):
+                self.rows = [
+                    row(delivery_id="backlog-one"),
+                    row(delivery_id="backlog-two"),
+                    row(delivery_id="backlog-three"),
+                ]
+                self.calls = []
+
+            async def claim_due(self, *, limit, now, lease_seconds, preferred_delivery_ids=None):
+                self.calls.append(tuple(preferred_delivery_ids or ()))
+                if not self.rows:
+                    return []
+                return [self.rows.pop(0)]
+
+            async def succeed(self, *_args, **_kwargs): pass
+            async def retry(self, *_args, **_kwargs): pass
+            async def dead_letter(self, *_args, **_kwargs): pass
+
+        repository = StalePreferredOutbox()
+        worker = AlertDeliveryWorker(
+            repository,
+            Sender(DeliveryAttempt(True, 204)),
+            concurrency=1,
+            clock=lambda: 110,
+        )
+
+        self.assertEqual(
+            await worker._drain(preferred_delivery_ids=("stale",)),
+            3,
+        )
+        self.assertEqual(repository.calls, [("stale",), (), (), ()])
+
+    async def test_wakeup_claims_preferred_rows_without_waiting_for_fallback_scan(self):
+        repository = WakeupOutbox([row(delivery_id="fast")])
+        sender = RecordingSender(DeliveryAttempt(True, 204))
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            clock=lambda: 110,
+            fallback_poll_seconds=10,
+        )
+        task = asyncio.create_task(worker.run())
+        try:
+            await asyncio.wait_for(repository.initial_scan.wait(), timeout=0.2)
+            worker.wake(["fast"])
+            await asyncio.wait_for(sender.sent.wait(), timeout=0.2)
+            self.assertIn(("fast",), repository.calls)
+        finally:
+            worker.stop()
+            await asyncio.wait_for(task, timeout=0.2)
+
+    async def test_preferred_claims_fall_back_for_legacy_repositories(self):
+        repository = MemoryOutbox([row(delivery_id="legacy")])
+        worker = AlertDeliveryWorker(repository, Sender(DeliveryAttempt(True, 204)), clock=lambda: 110)
+        self.assertEqual(await worker.run_once(preferred_delivery_ids=["legacy"]), 1)
+        self.assertEqual(repository.calls[0][1], "legacy")
+
+    async def test_preleased_row_is_sent_before_any_repository_claim(self):
+        repository = EmptyOutbox([])
+        sender = RecordingSender(DeliveryAttempt(True, 204))
+        wakeup = OutboxWakeup()
+        delivery = row(delivery_id="preleased")
+        wakeup.wake_preleased((delivery,))
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            wakeup=wakeup,
+            clock=lambda: 110,
+        )
+
+        self.assertEqual(
+            await worker._drain(preleased=wakeup.take_preleased()),
+            1,
+        )
+        self.assertTrue(sender.sent.is_set())
+        self.assertEqual(repository.calls[0][0], "success")
+        self.assertEqual(repository.calls[1][0], "claim")
+
+    async def test_preleased_rows_still_obey_target_send_concurrency(self):
+        class BlockingSender:
+            def __init__(self):
+                self.active = 0
+                self.peak = 0
+                self.two_started = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send(self, _delivery):
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                if self.active == 2:
+                    self.two_started.set()
+                await self.release.wait()
+                self.active -= 1
+                return DeliveryAttempt(True, 204)
+
+        repository = EmptyOutbox([])
+        sender = BlockingSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=4,
+            per_target_concurrency=2,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id="same")
+            for index in range(4)
+        )
+        task = asyncio.create_task(worker._drain(preleased=deliveries))
+        await asyncio.wait_for(sender.two_started.wait(), timeout=0.2)
+        await asyncio.sleep(0)
+        self.assertEqual(sender.peak, 2)
+        sender.release.set()
+        self.assertEqual(await asyncio.wait_for(task, timeout=0.2), 4)
+        self.assertEqual(sender.peak, 2)
+
+    async def test_failed_prelease_drain_requeues_failed_and_pending_rows(self):
+        class FailingOutbox(EmptyOutbox):
+            async def succeed(self, delivery_id, **kwargs):
+                self.calls.append(("success", delivery_id, kwargs))
+                if delivery_id == "preleased-0":
+                    raise RuntimeError("database unavailable")
+
+        repository = FailingOutbox([])
+        wakeup = OutboxWakeup()
+        worker = AlertDeliveryWorker(
+            repository,
+            Sender(DeliveryAttempt(True, 204)),
+            concurrency=2,
+            wakeup=wakeup,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id=f"target-{index}")
+            for index in range(4)
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+            await worker._drain(preleased=deliveries)
+
+        self.assertEqual(
+            {
+                delivery.delivery_id
+                for delivery in wakeup.take_preleased()
+            },
+            {"preleased-0", "preleased-2", "preleased-3"},
+        )
+
+    async def test_cancelled_prelease_drain_releases_all_outstanding_rows(self):
+        class ReleasingOutbox(EmptyOutbox):
+            def __init__(self):
+                super().__init__([])
+                self.released = ()
+
+            async def release_preleases(self, delivery_ids):
+                self.released = tuple(delivery_ids)
+
+        class BlockingSender:
+            def __init__(self):
+                self.started = asyncio.Event()
+
+            async def send(self, _delivery):
+                self.started.set()
+                await asyncio.Event().wait()
+
+        repository = ReleasingOutbox()
+        sender = BlockingSender()
+        worker = AlertDeliveryWorker(
+            repository,
+            sender,
+            concurrency=1,
+            clock=lambda: 110,
+        )
+        deliveries = tuple(
+            row(delivery_id=f"preleased-{index}", target_id=f"target-{index}")
+            for index in range(3)
+        )
+        task = asyncio.create_task(worker._drain(preleased=deliveries))
+        await asyncio.wait_for(sender.started.wait(), timeout=0.2)
+        task.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(
+            repository.released,
+            ("preleased-0", "preleased-1", "preleased-2"),
+        )
+
+
+class WakeupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_wakeup_coalesces_ids_and_notification_payloads(self):
+        wakeup = OutboxWakeup()
+        adapter = PostgresOutboxNotificationAdapter(wakeup)
+        adapter.on_notification('{"delivery_ids":["a","b","a"]}')
+        self.assertEqual(await wakeup.wait(), ("a", "b"))
+        adapter.on_notification("delivery-c")
+        self.assertEqual(wakeup.take_preferred_delivery_ids(), ("delivery-c",))
+
+    async def test_invalid_notification_still_wakes_worker(self):
+        wakeup = OutboxWakeup()
+        PostgresOutboxNotificationAdapter(wakeup).on_notification("not-json")
+        self.assertEqual(await wakeup.wait(), ("not-json",))
+
+    async def test_preleased_deliveries_are_deduplicated_by_delivery_id(self):
+        wakeup = OutboxWakeup()
+        first = row(delivery_id="preleased")
+        duplicate = row(delivery_id="preleased")
+        wakeup.wake_preleased((first, duplicate))
+        self.assertEqual(wakeup.take_preleased(), (first,))
+        self.assertIsNone(wakeup.pop_wake_time("preleased"))
 
 
 class GenericSenderTests(unittest.IsolatedAsyncioTestCase):
