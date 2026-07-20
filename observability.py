@@ -6,11 +6,14 @@ export the snapshots to Prometheus or OpenTelemetry without changing workers.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from threading import Lock
 from typing import Mapping
+
+
+DEFAULT_HISTOGRAM_SAMPLE_LIMIT = 2048
 
 
 def _labels(labels: Mapping[str, str] | None = None) -> tuple[tuple[str, str], ...]:
@@ -27,14 +30,22 @@ class HealthStatus(str, Enum):
 class DeliveryMetrics:
     """In-memory metric facade suitable for tests and lightweight deployments."""
 
+    histogram_sample_limit: int = DEFAULT_HISTOGRAM_SAMPLE_LIMIT
     counters: dict[tuple[str, tuple[tuple[str, str], ...]], int] = field(
         default_factory=lambda: defaultdict(int)
     )
-    histograms: dict[tuple[str, tuple[tuple[str, str], ...]], list[float]] = field(
-        default_factory=lambda: defaultdict(list)
-    )
+    histograms: dict[
+        tuple[str, tuple[tuple[str, str], ...]], deque[float]
+    ] = field(init=False)
     gauges: dict[tuple[str, tuple[tuple[str, str], ...]], float] = field(default_factory=dict)
     _lock: Lock = field(default_factory=Lock, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.histogram_sample_limit <= 0:
+            raise ValueError("histogram_sample_limit must be positive")
+        self.histograms = defaultdict(
+            lambda: deque(maxlen=self.histogram_sample_limit)
+        )
 
     def increment(self, name: str, value: int = 1, labels: Mapping[str, str] | None = None) -> None:
         with self._lock:
