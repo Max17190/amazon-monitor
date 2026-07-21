@@ -116,6 +116,13 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
             versions = await connection.fetchval(
                 "SELECT COUNT(*) FROM monitor_schema_migrations"
             )
+            migrations_rls_enabled = await connection.fetchval(
+                """
+                SELECT relrowsecurity
+                FROM pg_class
+                WHERE oid = 'public.monitor_schema_migrations'::regclass
+                """
+            )
             circuits = await connection.fetchval(
                 """
                 SELECT to_regclass(
@@ -123,7 +130,8 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ) IS NOT NULL
                 """
             )
-        self.assertEqual(versions, 3)
+        self.assertEqual(versions, 4)
+        self.assertTrue(migrations_rls_enabled)
         self.assertTrue(circuits)
 
     async def test_transition_and_delivery_intents_commit_atomically(self):
