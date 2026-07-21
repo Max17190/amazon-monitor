@@ -27,6 +27,25 @@ from durable_store import (
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL")
 
+INTERNAL_TABLES = (
+    "monitor_schema_migrations",
+    "credential_governor",
+    "credential_cadence_calibrations",
+    "product_states",
+    "stock_transitions",
+    "stock_verification_jobs",
+    "alert_events",
+    "alert_deliveries",
+    "alert_target_circuits",
+    "alert_delivery_attempts",
+    "alert_dead_letters",
+)
+
+INTERNAL_SEQUENCES = (
+    "alert_delivery_attempts_attempt_id_seq",
+    "alert_dead_letters_dead_letter_id_seq",
+)
+
 
 @unittest.skipUnless(
     TEST_DATABASE_URL,
@@ -130,9 +149,72 @@ class PostgresIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 ) IS NOT NULL
                 """
             )
-        self.assertEqual(versions, 4)
+        self.assertEqual(versions, 5)
         self.assertTrue(migrations_rls_enabled)
         self.assertTrue(circuits)
+
+    async def test_internal_tables_are_hidden_from_api_roles(self):
+        async with self.store.pool.acquire() as connection:
+            table_security = await connection.fetch(
+                """
+                SELECT c.relname, c.relrowsecurity
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public'
+                  AND c.relname = ANY($1::text[])
+                ORDER BY c.relname
+                """,
+                list(INTERNAL_TABLES),
+            )
+            table_grants = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM information_schema.role_table_grants
+                WHERE table_schema = 'public'
+                  AND table_name = ANY($1::text[])
+                  AND grantee = ANY($2::text[])
+                """,
+                list(INTERNAL_TABLES),
+                ["anon", "authenticated"],
+            )
+            sequence_grants = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM pg_roles r
+                CROSS JOIN unnest($1::text[]) AS s(sequence_name)
+                WHERE r.rolname = ANY($2::text[])
+                  AND has_sequence_privilege(
+                      r.rolname,
+                      format('public.%I', s.sequence_name),
+                      'USAGE,SELECT,UPDATE'
+                  )
+                """,
+                list(INTERNAL_SEQUENCES),
+                ["anon", "authenticated"],
+            )
+            default_api_grants = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM pg_default_acl d
+                CROSS JOIN LATERAL aclexplode(d.defaclacl) a
+                JOIN pg_roles grantee ON grantee.oid = a.grantee
+                WHERE d.defaclnamespace = 'public'::regnamespace
+                  AND d.defaclrole = current_user::regrole
+                  AND d.defaclobjtype = ANY($1::char[])
+                  AND grantee.rolname = ANY($2::text[])
+                """,
+                ["r", "S"],
+                ["anon", "authenticated"],
+            )
+
+        self.assertEqual(
+            {row["relname"] for row in table_security},
+            set(INTERNAL_TABLES),
+        )
+        self.assertTrue(all(row["relrowsecurity"] for row in table_security))
+        self.assertEqual(table_grants, 0)
+        self.assertEqual(sequence_grants, 0)
+        self.assertEqual(default_api_grants, 0)
 
     async def test_transition_and_delivery_intents_commit_atomically(self):
         scope = ScopeKey(
