@@ -522,10 +522,15 @@ If you are using `auth.json`, mount it into the container or supply cookie env v
 
 ### Railway
 
-Railway is used only for explicitly triggered, one-shot canaries. Do not run a
-persistent monitor service there. Configure `AUTH_JSON` and, if needed,
-`PROXY_URLS_JSON` as Railway secrets, execute the bounded canary, inspect the
-terminal deployment result, and let the service exit.
+The checked-in Railway configuration runs the persistent monitor worker.
+Configure `AUTH_JSON`, `DATABASE_URL`, `MONITOR_CONFIG_JSON`, and the selected
+webhook variables as Railway secrets. The startup wrapper materializes
+`AUTH_JSON` inside the ephemeral container with owner-only permissions, then
+starts the durable monitor and applies pending database migrations.
+
+For an explicitly triggered one-shot canary, override the start command with
+`sh run_railway_canary.sh`, inspect the terminal deployment result, and let the
+service exit.
 
 Run the internal acceptance benchmark before using credentials:
 
