@@ -88,6 +88,7 @@ class TVSSRequestTiming:
     credential_queue_ms: float = 0.0
     cadence_wait_ms: float = 0.0
     half_open_probe: bool = False
+    confirmation_slot_borrowed: bool = False
     status: int = 0
 
     @property
@@ -346,6 +347,7 @@ class TVSSClient:
         url,
         json_body=None,
         request_class=None,
+        borrow_confirmation_slot=False,
     ):
         request_class = request_class or self._request_class.get()
         if self._traffic_lock is None:
@@ -360,6 +362,7 @@ class TVSSClient:
                 json_body=json_body,
                 credential_queue_ms=queue_ms,
                 request_class=request_class,
+                borrow_confirmation_slot=borrow_confirmation_slot,
             )
 
     async def _request_serialized(
@@ -370,6 +373,7 @@ class TVSSClient:
         json_body=None,
         credential_queue_ms=0.0,
         request_class=RequestClass.CONFIRM,
+        borrow_confirmation_slot=False,
     ):
         timing = TVSSRequestTiming()
         timing.credential_queue_ms = credential_queue_ms
@@ -385,11 +389,23 @@ class TVSSClient:
         for attempt, route in enumerate(routes, start=1):
             permit = None
             if self.durable_governor is not None:
-                permit = await self.durable_governor.acquire_permit(
-                    self.credential_key,
-                    request_class,
-                    owner_id=self.credential_owner_id,
-                )
+                if (
+                    borrow_confirmation_slot
+                    and request_class is RequestClass.CONFIRM
+                ):
+                    permit = (
+                        await self.durable_governor
+                        .acquire_borrowed_confirmation_permit(
+                            self.credential_key,
+                            owner_id=self.credential_owner_id,
+                        )
+                    )
+                else:
+                    permit = await self.durable_governor.acquire_permit(
+                        self.credential_key,
+                        request_class,
+                        owner_id=self.credential_owner_id,
+                    )
                 if permit.wait_seconds:
                     await asyncio.sleep(permit.wait_seconds)
                 # A permit can wait for a full cadence slot. Revalidate after
@@ -401,6 +417,7 @@ class TVSSClient:
                     )
                 timing.cadence_wait_ms += permit.wait_seconds * 1000.0
                 timing.half_open_probe = permit.half_open_probe
+                timing.confirmation_slot_borrowed = permit.borrowed
             attempt_started_ns = time.perf_counter_ns()
             timing.attempts = attempt
             timing.route_id = route.route_id
@@ -517,11 +534,16 @@ class TVSSClient:
             raise last_network_error
         raise RuntimeError("TVSS request had no available route")
 
-    async def product(self, session, asin):
+    async def product(self, session, asin, *, borrow_confirmation_slot=False):
         url = f"{self._product_url_prefix}{asin}?sif_profile=tvss"
         token = self._request_class.set(RequestClass.CONFIRM)
         try:
-            data = await self._request(session, "GET", url)
+            data = await self._request(
+                session,
+                "GET",
+                url,
+                borrow_confirmation_slot=borrow_confirmation_slot,
+            )
         finally:
             self._request_class.reset(token)
         return self._parse_product(data, asin)

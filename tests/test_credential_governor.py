@@ -173,6 +173,34 @@ class CredentialGovernorTests(unittest.TestCase):
         self.assertEqual(second.scheduled_at, 105.0)
         self.assertEqual(second.wait_seconds, 5.0)
 
+    def test_borrowed_confirmation_runs_now_and_defers_next_poll(self):
+        first = self.await_(
+            self.governor.acquire_permit(self.key, RequestClass.POLL)
+        )
+        borrowed = self.await_(
+            self.governor.acquire_borrowed_confirmation_permit(self.key)
+        )
+        following = self.await_(
+            self.governor.acquire_permit(self.key, RequestClass.POLL)
+        )
+
+        self.assertEqual(first.scheduled_at, 100.0)
+        self.assertEqual(borrowed.scheduled_at, 100.0)
+        self.assertEqual(borrowed.wait_seconds, 0.0)
+        self.assertTrue(borrowed.borrowed)
+        self.assertEqual(following.scheduled_at, 110.0)
+
+    def test_borrowed_confirmation_cannot_bypass_half_open_poll(self):
+        permit = self.await_(
+            self.governor.acquire_permit(self.key, RequestClass.POLL)
+        )
+        self.await_(self.governor.record_result(permit, 429))
+
+        with self.assertRaises(HalfOpenPollRequired):
+            self.await_(
+                self.governor.acquire_borrowed_confirmation_permit(self.key)
+            )
+
     def test_429_persists_cooldown_doubles_interval_and_allows_one_probe(self):
         permit = self.await_(self.governor.acquire_permit(self.key, RequestClass.POLL))
         snapshot = self.await_(self.governor.record_result(permit, 429))

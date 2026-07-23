@@ -174,6 +174,7 @@ async def validate(client, session, asins, interval, observations):
                 "observations": len(latencies),
                 "p50_ms": percentile(latencies, 50) if latencies else None,
                 "p95_ms": percentile(latencies, 95) if latencies else None,
+                "samples_ms": latencies,
             }
         latencies.append(latency_ms)
         next_start = advance_deadline(next_start, interval)
@@ -184,6 +185,7 @@ async def validate(client, session, asins, interval, observations):
         "observations": len(latencies),
         "p50_ms": percentile(latencies, 50),
         "p95_ms": percentile(latencies, 95),
+        "samples_ms": latencies,
     }
 
 

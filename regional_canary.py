@@ -165,7 +165,16 @@ async def run(args):
         json.dumps(
             {
                 "stage": "regional_validation",
+                "experiment_id": args.experiment_id,
+                "variant": args.variant,
+                "block": args.block,
                 "accepted": accepted,
+                "outcome": result["outcome"],
+                "error_count": int(result["outcome"] == "error"),
+                "rate_limit_count": int(
+                    result["outcome"] == "rate_limited"
+                ),
+                "mismatch_count": 0,
                 "region": os.getenv("RAILWAY_REPLICA_REGION", "local"),
                 "database_region": os.getenv("DATABASE_REGION", "unknown"),
                 "direct_route": True,
@@ -175,7 +184,13 @@ async def run(args):
                 "webhook_connect_p95_ms": webhook_connect_p95,
                 "detect_to_accept_p95_ms": detect_to_accept_p95,
                 "calibration": calibration_summary(calibration_key, result),
-                **result,
+                "interval_seconds": result["interval_seconds"],
+                "observations": result["observations"],
+                "p50_ms": result["p50_ms"],
+                "p95_ms": result["p95_ms"],
+                "samples": {
+                    "tvss_request_ms": result.get("samples_ms", []),
+                },
             },
             sort_keys=True,
         )
@@ -193,6 +208,19 @@ def main():
         "--observations",
         type=int,
         default=CALIBRATION_REQUIRED_OBSERVATIONS,
+    )
+    parser.add_argument(
+        "--experiment-id",
+        default=os.getenv("PERFORMANCE_EXPERIMENT_ID", "regional"),
+    )
+    parser.add_argument(
+        "--variant",
+        default=os.getenv("PERFORMANCE_VARIANT", "control"),
+    )
+    parser.add_argument(
+        "--block",
+        type=int,
+        default=int(os.getenv("PERFORMANCE_BLOCK", "1")),
     )
     args = parser.parse_args()
     if not args.confirm:
