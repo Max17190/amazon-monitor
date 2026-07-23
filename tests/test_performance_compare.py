@@ -55,6 +55,44 @@ class PerformanceCompareTests(unittest.TestCase):
                 min_samples=120,
             )
 
+    def test_zero_control_percentiles_produce_rejected_gate_result(self):
+        values = records()
+        for record in values:
+            record["samples"]["latency_ms"] = [0.0] * 60
+
+        result = compare(
+            values,
+            "latency_ms",
+            min_samples=120,
+        )
+
+        self.assertFalse(result["accepted"])
+        self.assertIsNone(result["p95_relative_improvement"])
+        self.assertEqual(result["p99_regression"], 0.0)
+
+    def test_rejects_mixed_experiments_without_explicit_selection(self):
+        first = records()
+        second = records()
+        for record in first:
+            record["experiment_id"] = "first"
+        for record in second:
+            record["experiment_id"] = "second"
+
+        with self.assertRaisesRegex(ValueError, "multiple experiment_id"):
+            compare(
+                first + second,
+                "latency_ms",
+                min_samples=120,
+            )
+
+        result = compare(
+            first + second,
+            "latency_ms",
+            min_samples=120,
+            experiment_id="first",
+        )
+        self.assertEqual(result["experiment_id"], "first")
+
 
 if __name__ == "__main__":
     unittest.main()

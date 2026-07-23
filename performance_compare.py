@@ -44,6 +44,39 @@ def read_records(paths):
     return records
 
 
+def select_experiment(records, experiment_id=None):
+    present_ids = {
+        str(record["experiment_id"])
+        for record in records
+        if record.get("experiment_id") not in (None, "")
+    }
+    missing_count = sum(
+        record.get("experiment_id") in (None, "")
+        for record in records
+    )
+    if present_ids and missing_count:
+        raise ValueError(
+            "cannot combine records with and without experiment_id"
+        )
+    if experiment_id is not None:
+        selected = [
+            record
+            for record in records
+            if str(record.get("experiment_id")) == str(experiment_id)
+        ]
+        if not selected:
+            raise ValueError(
+                f"experiment_id {experiment_id!r} has no records"
+            )
+        return selected, str(experiment_id)
+    if len(present_ids) > 1:
+        raise ValueError(
+            "multiple experiment_id values require an explicit selection"
+        )
+    resolved = next(iter(present_ids), None)
+    return list(records), resolved
+
+
 def validate_abba(records, control, candidate):
     by_block = {}
     for record in records:
@@ -94,7 +127,12 @@ def compare(
     min_absolute_improvement_ms=10.0,
     min_relative_improvement=0.05,
     max_p99_regression=0.05,
+    experiment_id=None,
 ):
+    records, resolved_experiment_id = select_experiment(
+        records,
+        experiment_id,
+    )
     validate_abba(records, control, candidate)
     failures = [
         record
@@ -136,10 +174,30 @@ def compare(
     absolute_improvement = (
         control_stats["p95_ms"] - candidate_stats["p95_ms"]
     )
-    relative_improvement = absolute_improvement / control_stats["p95_ms"]
-    p99_regression = (
-        candidate_stats["p99_ms"] - control_stats["p99_ms"]
-    ) / control_stats["p99_ms"]
+    if control_stats["p95_ms"] == 0:
+        relative_improvement = None
+        relative_gate_passed = False
+    else:
+        relative_improvement = (
+            absolute_improvement / control_stats["p95_ms"]
+        )
+        relative_gate_passed = (
+            relative_improvement >= float(min_relative_improvement)
+        )
+    if control_stats["p99_ms"] == 0:
+        if candidate_stats["p99_ms"] == 0:
+            p99_regression = 0.0
+            p99_gate_passed = True
+        else:
+            p99_regression = None
+            p99_gate_passed = False
+    else:
+        p99_regression = (
+            candidate_stats["p99_ms"] - control_stats["p99_ms"]
+        ) / control_stats["p99_ms"]
+        p99_gate_passed = (
+            p99_regression <= float(max_p99_regression)
+        )
     median_delta_ci = bootstrap_median_delta(
         control_values,
         candidate_values,
@@ -147,12 +205,13 @@ def compare(
     accepted = (
         not failures
         and absolute_improvement >= float(min_absolute_improvement_ms)
-        and relative_improvement >= float(min_relative_improvement)
-        and p99_regression <= float(max_p99_regression)
+        and relative_gate_passed
+        and p99_gate_passed
         and median_delta_ci[1] < 0
     )
     return {
         "stage": "performance_comparison",
+        "experiment_id": resolved_experiment_id,
         "accepted": accepted,
         "metric": metric,
         "control": control_stats,
@@ -179,6 +238,7 @@ def main():
     parser.add_argument("--metric", required=True)
     parser.add_argument("--control", default="control")
     parser.add_argument("--candidate", default="candidate")
+    parser.add_argument("--experiment-id")
     parser.add_argument("--min-samples", type=int, default=120)
     parser.add_argument(
         "--min-absolute-improvement-ms",
@@ -205,6 +265,7 @@ def main():
         min_absolute_improvement_ms=args.min_absolute_improvement_ms,
         min_relative_improvement=args.min_relative_improvement,
         max_p99_regression=args.max_p99_regression,
+        experiment_id=args.experiment_id,
     )
     print(json.dumps(result, sort_keys=True))
     raise SystemExit(0 if result["accepted"] else 1)

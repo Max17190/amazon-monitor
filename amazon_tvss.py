@@ -385,14 +385,15 @@ class TVSSClient:
         timing.request_started_ns = time.perf_counter_ns()
         routes = self.proxy_pool.request_routes()
         last_network_error = None
+        borrow_available = (
+            borrow_confirmation_slot
+            and request_class is RequestClass.CONFIRM
+        )
 
         for attempt, route in enumerate(routes, start=1):
             permit = None
             if self.durable_governor is not None:
-                if (
-                    borrow_confirmation_slot
-                    and request_class is RequestClass.CONFIRM
-                ):
+                if borrow_available:
                     permit = (
                         await self.durable_governor
                         .acquire_borrowed_confirmation_permit(
@@ -400,6 +401,7 @@ class TVSSClient:
                             owner_id=self.credential_owner_id,
                         )
                     )
+                    borrow_available = False
                 else:
                     permit = await self.durable_governor.acquire_permit(
                         self.credential_key,
@@ -417,7 +419,9 @@ class TVSSClient:
                     )
                 timing.cadence_wait_ms += permit.wait_seconds * 1000.0
                 timing.half_open_probe = permit.half_open_probe
-                timing.confirmation_slot_borrowed = permit.borrowed
+                timing.confirmation_slot_borrowed = (
+                    timing.confirmation_slot_borrowed or permit.borrowed
+                )
             attempt_started_ns = time.perf_counter_ns()
             timing.attempts = attempt
             timing.route_id = route.route_id
