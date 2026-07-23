@@ -313,7 +313,7 @@ LOG_LEVEL=INFO
 | `ALERT_DEAD_LETTER_RETENTION_DAYS` | `30` | Dead-letter audit retention before cleanup. |
 | `STOCK_CONFIRM_TTL_SECONDS` | `90` | Maximum age for a full-product confirmation job. |
 | `STOCK_OOS_REARM_COUNT` | `2` | Strong, cadence-separated out-of-stock observations required to rearm. Values below two are rejected. |
-| `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics. |
+| `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics when `PORT` is not assigned by the platform. |
 | `DATABASE_POOL_SIZE` | `40` | Maximum asyncpg client connections. Benchmark smaller values before changing production. |
 | `PERFORMANCE_EXPERIMENT_ID` | `production` | Stable identifier included in structured performance windows. |
 | `PERFORMANCE_VARIANT` | `control` | Low-cardinality control or candidate label for performance comparisons. |

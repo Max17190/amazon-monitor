@@ -133,6 +133,15 @@ def _parse_bool(value, default=False):
     return str(value).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _operations_port(env=None):
+    env = os.environ if env is None else env
+    return int(
+        env.get("PORT")
+        or env.get("METRICS_PORT")
+        or DEFAULT_METRICS_PORT
+    )
+
+
 def validate_durable_configuration(config, env=None):
     env = os.environ if env is None else env
     if not env.get("DATABASE_URL"):
@@ -2105,7 +2114,7 @@ async def run_durable_monitor(config, webhook_targets):
                 metrics,
                 delivery_health,
                 runtime_status,
-                int(os.getenv("METRICS_PORT", str(DEFAULT_METRICS_PORT))),
+                _operations_port(),
             )
             await operations.start()
             worker_task = asyncio.create_task(
