@@ -1034,7 +1034,7 @@ class CredentialRateControllerTests(unittest.TestCase):
             asyncio.run(client._request(session, "GET", "https://tvss.amazon.com/test"))
         self.assertEqual(session.requests, 0)
 
-    def test_confirmation_route_retry_borrows_only_first_slot(self):
+    def test_borrowed_confirmation_does_not_consume_fallback_slot(self):
         class Governor:
             def __init__(self):
                 self.borrowed = 0
@@ -1144,18 +1144,24 @@ class CredentialRateControllerTests(unittest.TestCase):
         )
         client.proxy_pool = FakePool()
 
-        asyncio.run(
-            client._request(
-                FakeSession(),
-                "GET",
-                "https://tvss.amazon.com/test",
-                request_class=RequestClass.CONFIRM,
-                borrow_confirmation_slot=True,
+        session = FakeSession()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "borrowed confirmation network failure",
+        ):
+            asyncio.run(
+                client._request(
+                    session,
+                    "GET",
+                    "https://tvss.amazon.com/test",
+                    request_class=RequestClass.CONFIRM,
+                    borrow_confirmation_slot=True,
+                )
             )
-        )
 
         self.assertEqual(governor.borrowed, 1)
-        self.assertEqual(governor.scheduled, 1)
+        self.assertEqual(governor.scheduled, 0)
+        self.assertEqual(session.requests, 1)
         self.assertTrue(
             client.last_request_timing.confirmation_slot_borrowed
         )

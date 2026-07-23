@@ -55,6 +55,21 @@ class PerformanceCompareTests(unittest.TestCase):
                 min_samples=120,
             )
 
+    def test_rejects_duplicate_block_records(self):
+        values = records()
+        values.append(dict(values[0]))
+
+        with self.assertRaisesRegex(ValueError, "duplicate block 1"):
+            compare(values, "latency_ms", min_samples=120)
+
+    def test_rejects_noncontiguous_block_records(self):
+        values = records()
+        values[2]["block"] = 4
+        values[3]["block"] = 5
+
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            compare(values, "latency_ms", min_samples=120)
+
     def test_zero_control_percentiles_produce_rejected_gate_result(self):
         values = records()
         for record in values:

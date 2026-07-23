@@ -82,10 +82,16 @@ def validate_abba(records, control, candidate):
     for record in records:
         block = int(record["block"])
         variant = str(record["variant"])
-        if block in by_block and by_block[block] != variant:
-            raise ValueError(f"block {block} contains multiple variants")
+        if block in by_block:
+            raise ValueError(f"duplicate block {block}")
         by_block[block] = variant
-    ordered = [by_block[index] for index in sorted(by_block)]
+    block_ids = sorted(by_block)
+    expected_ids = list(range(1, len(block_ids) + 1))
+    if block_ids != expected_ids:
+        raise ValueError(
+            "ABBA block numbers must be contiguous and start at 1"
+        )
+    ordered = [by_block[index] for index in block_ids]
     if len(ordered) < 4 or len(ordered) % 4:
         raise ValueError("ABBA comparison requires a multiple of four blocks")
     expected = [control, candidate, candidate, control]

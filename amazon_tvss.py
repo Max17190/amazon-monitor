@@ -528,6 +528,12 @@ class TVSSClient:
                     route.route_id,
                     attempt,
                 )
+                if permit is not None and permit.borrowed:
+                    self.last_request_timing = timing
+                    raise RuntimeError(
+                        "TVSS borrowed confirmation network failure after "
+                        "one route attempt"
+                    ) from exc
                 if attempt >= len(routes):
                     self.last_request_timing = timing
                     raise RuntimeError(
