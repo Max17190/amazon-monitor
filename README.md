@@ -501,6 +501,15 @@ The operations server exposes:
 - `GET /health/ready`
 - `GET /metrics`
 
+Run the isolated confirmation-slot ABBA canary before enabling slot borrowing:
+
+```bash
+python confirmation_slot_canary.py
+```
+
+The canary compares confirmation-start delay while verifying that both variants
+preserve the same following poll slot.
+
 Dead-lettered target deliveries can be inspected and controlled without
 reopening the stock transition:
 
