@@ -160,10 +160,17 @@ async def wait_for_delivery_completion(store, delivery_ids):
             await asyncio.sleep(0)
 
 
-async def run(database_url, iterations, warmup_iterations=10):
+async def run(
+    database_url,
+    iterations,
+    warmup_iterations=10,
+    pool_max_size=8,
+):
     monitor_id = f"latency-benchmark-{uuid4()}"
     store = await PostgresStore.connect(
-        database_url, min_size=2, max_size=8
+        database_url,
+        min_size=2,
+        max_size=max(2, int(pool_max_size)),
     )
     await store.migrate()
     credential_key = f"benchmark-{uuid4()}"
@@ -324,8 +331,20 @@ async def run(database_url, iterations, warmup_iterations=10):
         await store.close()
 
     result = {
+        "stage": "performance_result",
+        "experiment_id": os.getenv(
+            "PERFORMANCE_EXPERIMENT_ID",
+            "durable-latency",
+        ),
+        "variant": os.getenv("PERFORMANCE_VARIANT", "control"),
+        "block": int(os.getenv("PERFORMANCE_BLOCK", "1")),
+        "outcome": "clean",
+        "error_count": 0,
+        "rate_limit_count": 0,
+        "mismatch_count": 0,
         "iterations": iterations,
         "warmup_iterations": warmup_iterations,
+        "pool_max_size": int(pool_max_size),
         "asins": len(ASINS),
         "response_to_commit_p50_ms": round(percentile(commit_ms, 50), 3),
         "response_to_commit_p95_ms": round(percentile(commit_ms, 95), 3),
@@ -346,6 +365,11 @@ async def run(database_url, iterations, warmup_iterations=10):
             "commit_to_first_attempt_p95_ms": 1,
             "response_to_local_accept_p95_ms": 20,
         },
+        "samples": {
+            "response_to_commit_ms": commit_ms,
+            "commit_to_first_attempt_ms": commit_to_attempt_ms,
+            "response_to_local_accept_ms": response_to_accept_ms,
+        },
     }
     result["accepted"] = (
         result["response_to_commit_p95_ms"] < 20
@@ -364,6 +388,7 @@ def main():
     )
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup-iterations", type=int, default=10)
+    parser.add_argument("--pool-max-size", type=int, default=8)
     parser.add_argument("--confirm-database-writes", action="store_true")
     args = parser.parse_args()
     if not args.database_url:
@@ -374,12 +399,15 @@ def main():
         parser.error("--iterations must be positive")
     if args.warmup_iterations < 0:
         parser.error("--warmup-iterations cannot be negative")
+    if args.pool_max_size < 2:
+        parser.error("--pool-max-size must be at least two")
     raise SystemExit(
         asyncio.run(
             run(
                 args.database_url,
                 args.iterations,
                 args.warmup_iterations,
+                args.pool_max_size,
             )
         )
     )

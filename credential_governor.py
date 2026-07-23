@@ -39,6 +39,7 @@ class Permit:
     generation: int
     half_open_probe: bool
     lease_owner: Optional[str] = None
+    borrowed: bool = False
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,11 @@ class CredentialGovernor(Protocol):
         self,
         credential_key: str,
         request_class: RequestClass,
+        owner_id: Optional[str] = None,
+    ) -> Permit: ...
+    async def acquire_borrowed_confirmation_permit(
+        self,
+        credential_key: str,
         owner_id: Optional[str] = None,
     ) -> Permit: ...
     async def record_result(
@@ -236,6 +242,34 @@ def _reserve(
     )
 
 
+def _borrow_confirmation(
+    key: str,
+    state: _State,
+    now: float,
+    owner_id: Optional[str] = None,
+) -> Permit:
+    """Use the next cadence slot now and move the following slot later."""
+    if state.half_open_pending or now < state.blocked_until:
+        return _reserve(
+            key,
+            state,
+            RequestClass.CONFIRM,
+            now,
+            owner_id,
+        )
+    state.next_request_at = max(state.next_request_at, now) + state.interval_seconds
+    return Permit(
+        credential_key=key,
+        request_class=RequestClass.CONFIRM,
+        scheduled_at=now,
+        wait_seconds=0.0,
+        generation=state.generation,
+        half_open_probe=False,
+        lease_owner=owner_id,
+        borrowed=True,
+    )
+
+
 def _record(
     key: str,
     state: _State,
@@ -377,6 +411,22 @@ class InMemoryCredentialGovernor:
             if owner_id is not None:
                 self._require_leader(state, owner_id, now)
             return _reserve(credential_key, state, request_class, now, owner_id)
+
+    async def acquire_borrowed_confirmation_permit(
+        self,
+        credential_key: str,
+        owner_id: Optional[str] = None,
+    ) -> Permit:
+        async with self._lock:
+            state, now = self._state(credential_key), self._clock()
+            if owner_id is not None:
+                self._require_leader(state, owner_id, now)
+            return _borrow_confirmation(
+                credential_key,
+                state,
+                now,
+                owner_id,
+            )
 
     async def record_result(
         self,
@@ -796,6 +846,22 @@ class PostgresCredentialGovernor:
             if owner_id is not None:
                 self._require_leader(state, owner_id, now)
             return _reserve(credential_key, state, request_class, now, owner_id)
+
+    async def acquire_borrowed_confirmation_permit(
+        self,
+        credential_key: str,
+        owner_id: Optional[str] = None,
+    ) -> Permit:
+        async with self._locked_state(credential_key) as (_, state):
+            now = self._clock()
+            if owner_id is not None:
+                self._require_leader(state, owner_id, now)
+            return _borrow_confirmation(
+                credential_key,
+                state,
+                now,
+                owner_id,
+            )
 
     async def record_result(
         self,

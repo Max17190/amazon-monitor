@@ -1034,6 +1034,138 @@ class CredentialRateControllerTests(unittest.TestCase):
             asyncio.run(client._request(session, "GET", "https://tvss.amazon.com/test"))
         self.assertEqual(session.requests, 0)
 
+    def test_borrowed_confirmation_does_not_consume_fallback_slot(self):
+        class Governor:
+            def __init__(self):
+                self.borrowed = 0
+                self.scheduled = 0
+
+            async def acquire_borrowed_confirmation_permit(
+                self,
+                key,
+                owner_id=None,
+            ):
+                self.borrowed += 1
+                return Permit(
+                    credential_key=key,
+                    request_class=RequestClass.CONFIRM,
+                    scheduled_at=0.0,
+                    wait_seconds=0.0,
+                    generation=0,
+                    half_open_probe=False,
+                    lease_owner=owner_id,
+                    borrowed=True,
+                )
+
+            async def acquire_permit(
+                self,
+                key,
+                request_class,
+                owner_id=None,
+            ):
+                self.scheduled += 1
+                return Permit(
+                    credential_key=key,
+                    request_class=request_class,
+                    scheduled_at=0.0,
+                    wait_seconds=0.0,
+                    generation=0,
+                    half_open_probe=False,
+                    lease_owner=owner_id,
+                )
+
+            async def ensure_leader(self, _key, _owner_id):
+                return None
+
+            async def record_result(self, *_args, **_kwargs):
+                return None
+
+        class FakePool:
+            def __init__(self):
+                self.routes = [
+                    types.SimpleNamespace(
+                        url="http://first.example",
+                        route_id="first",
+                        is_direct=False,
+                    ),
+                    types.SimpleNamespace(
+                        url="http://second.example",
+                        route_id="second",
+                        is_direct=False,
+                    ),
+                ]
+
+            def request_routes(self):
+                return self.routes
+
+            def record_failure(self, *_args, **_kwargs):
+                return None
+
+            def record_success(self, *_args, **_kwargs):
+                return None
+
+        class FakeResponse:
+            status = 200
+            headers = {}
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def read(self):
+                return b"{}"
+
+        class FakeSession:
+            def __init__(self):
+                self.requests = 0
+
+            def request(self, *_args, **_kwargs):
+                self.requests += 1
+                if self.requests == 1:
+                    raise aiohttp.ClientConnectionError("first route failed")
+                return FakeResponse()
+
+        with patch.dict(
+            os.environ,
+            {
+                "TVSS_COOKIE_HEADER": "session-id=1",
+                "PROXY_MODE": "direct",
+            },
+            clear=False,
+        ):
+            client = TVSSClient()
+        governor = Governor()
+        client.configure_durable_governor(
+            governor,
+            "credential",
+            "owner",
+        )
+        client.proxy_pool = FakePool()
+
+        session = FakeSession()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "borrowed confirmation network failure",
+        ):
+            asyncio.run(
+                client._request(
+                    session,
+                    "GET",
+                    "https://tvss.amazon.com/test",
+                    request_class=RequestClass.CONFIRM,
+                    borrow_confirmation_slot=True,
+                )
+            )
+
+        self.assertEqual(governor.borrowed, 1)
+        self.assertEqual(governor.scheduled, 0)
+        self.assertEqual(session.requests, 1)
+        self.assertTrue(
+            client.last_request_timing.confirmation_slot_borrowed
+        )
+
 
 class ProxyPoolTests(unittest.TestCase):
     def test_webshare_format_normalizes_without_exposing_credentials(self):

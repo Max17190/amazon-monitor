@@ -42,14 +42,14 @@ elif [ "$RAILWAY_CANARY_MODE" = "cadence" ]; then
     --asins "${CANARY_ASINS:-$LATENCY_ASINS}" \
     --discovery-seconds "${CANARY_DISCOVERY_SECONDS:-60}" \
     --quiet-seconds "${CANARY_QUIET_SECONDS:-900}" \
-    --validation-observations "${CANARY_VALIDATION_OBSERVATIONS:-60}"
+    --validation-observations "${CANARY_VALIDATION_OBSERVATIONS:-120}"
 elif [ "$RAILWAY_CANARY_MODE" = "regional" ]; then
   python regional_canary.py \
     --confirm \
     --asins "${CANARY_ASINS:-$LATENCY_ASINS}" \
     --interval "${CANARY_REGIONAL_INTERVAL:-5.0}" \
     --quiet-seconds "${CANARY_QUIET_SECONDS:-900}" \
-    --observations "${CANARY_VALIDATION_OBSERVATIONS:-60}"
+    --observations "${CANARY_VALIDATION_OBSERVATIONS:-120}"
 else
   python latency_e2e.py
 fi

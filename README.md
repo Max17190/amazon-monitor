@@ -269,6 +269,11 @@ ALERT_TARGET_CONCURRENCY=2
 ALERT_MAX_ATTEMPTS=10
 ALERT_MAX_AGE_SECONDS=900
 METRICS_PORT=9090
+DATABASE_POOL_SIZE=40
+PERFORMANCE_EXPERIMENT_ID=production
+PERFORMANCE_VARIANT=control
+PERFORMANCE_LOG_INTERVAL_SECONDS=300
+TVSS_CONFIRMATION_SLOT_BORROWING=false
 LOG_LEVEL=INFO
 ```
 
@@ -308,7 +313,12 @@ LOG_LEVEL=INFO
 | `ALERT_DEAD_LETTER_RETENTION_DAYS` | `30` | Dead-letter audit retention before cleanup. |
 | `STOCK_CONFIRM_TTL_SECONDS` | `90` | Maximum age for a full-product confirmation job. |
 | `STOCK_OOS_REARM_COUNT` | `2` | Strong, cadence-separated out-of-stock observations required to rearm. Values below two are rejected. |
-| `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics. |
+| `METRICS_PORT` | `9090` | Port for liveness, readiness, and Prometheus metrics when `PORT` is not assigned by the platform. |
+| `DATABASE_POOL_SIZE` | `40` | Maximum asyncpg client connections. Benchmark smaller values before changing production. |
+| `PERFORMANCE_EXPERIMENT_ID` | `production` | Stable identifier included in structured performance windows. |
+| `PERFORMANCE_VARIANT` | `control` | Low-cardinality control or candidate label for performance comparisons. |
+| `PERFORMANCE_LOG_INTERVAL_SECONDS` | `300` | Railway structured performance-window interval. Set to zero to disable. |
+| `TVSS_CONFIRMATION_SLOT_BORROWING` | `false` | Canary-only confirmed-alert policy. Uses the next request slot immediately and defers the following poll without adding a second polling stream. |
 | `PROXY_URL` | unset | Optional HTTP proxy URL. Credentials are never logged. |
 | `PROXY_URLS_JSON` | unset | JSON array of proxy URLs or `host:port:user:password` entries, suitable for a Railway secret. |
 | `PROXY_POOL_FILE` | unset | Ignored local proxy file with one URL or Webshare entry per line. |
@@ -326,6 +336,11 @@ credential queue wait, cadence wait, active route, attempt count, and unknown
 observation count. Rate-limit records add `Retry-After` and cooldown fields.
 Webhook completion emits its acknowledgment time separately. Proxy routes are
 identified only by opaque hashes.
+
+The durable monitor also emits a structured `performance_window` record every
+five minutes. It contains rolling p50, p95, p99, maximum, counts, counters,
+and gauges labeled with the Railway deployment, region, experiment, and
+variant. Use `performance_compare.py` to evaluate complete ABBA canary blocks.
 
 ## Latency
 
@@ -485,6 +500,15 @@ The operations server exposes:
 - `GET /health/live`
 - `GET /health/ready`
 - `GET /metrics`
+
+Run the isolated confirmation-slot ABBA canary before enabling slot borrowing:
+
+```bash
+python confirmation_slot_canary.py
+```
+
+The canary compares confirmation-start delay while verifying that both variants
+preserve the same following poll slot.
 
 Dead-lettered target deliveries can be inspected and controlled without
 reopening the stock transition:

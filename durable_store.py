@@ -2,6 +2,8 @@ import json
 import hashlib
 import logging
 import os
+import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -159,12 +161,20 @@ def _datetime_value(value):
 class PostgresStore:
     """Postgres authority for state, transitions, and alert delivery work."""
 
-    def __init__(self, pool, migrations_dir=None):
+    def __init__(self, pool, migrations_dir=None, metrics=None):
         self.pool = pool
         self.migrations_dir = Path(migrations_dir or DEFAULT_MIGRATIONS_DIR)
+        self.metrics = metrics
 
     @classmethod
-    async def connect(cls, dsn=None, min_size=1, max_size=10, migrations_dir=None):
+    async def connect(
+        cls,
+        dsn=None,
+        min_size=1,
+        max_size=10,
+        migrations_dir=None,
+        metrics=None,
+    ):
         if asyncpg is None:
             raise DurableStoreError(
                 "asyncpg is required for durable mode; install requirements.txt"
@@ -178,14 +188,35 @@ class PostgresStore:
             max_size=max(1, int(max_size)),
             command_timeout=10,
         )
-        return cls(pool, migrations_dir=migrations_dir)
+        return cls(pool, migrations_dir=migrations_dir, metrics=metrics)
+
+    @asynccontextmanager
+    async def acquire(self, operation):
+        queued_at = time.monotonic()
+        async with self.pool.acquire() as connection:
+            acquired_at = time.monotonic()
+            if self.metrics is not None:
+                self.metrics.observe(
+                    "database_pool_acquire_seconds",
+                    acquired_at - queued_at,
+                    labels={"operation": str(operation)},
+                )
+            try:
+                yield connection
+            finally:
+                if self.metrics is not None:
+                    self.metrics.observe(
+                        "database_operation_seconds",
+                        time.monotonic() - acquired_at,
+                        labels={"operation": str(operation)},
+                    )
 
     async def close(self):
         await self.pool.close()
 
     async def ping(self):
         try:
-            async with self.pool.acquire() as connection:
+            async with self.acquire("ping") as connection:
                 return bool(await connection.fetchval("SELECT TRUE"))
         except Exception:
             logging.exception("Postgres health check failed")
@@ -239,7 +270,7 @@ class PostgresStore:
                 )
 
     async def load_product_state(self, scope):
-        async with self.pool.acquire() as connection:
+        async with self.acquire("load_product_state") as connection:
             row = await connection.fetchrow(
                 """
                 SELECT *
@@ -319,7 +350,7 @@ class PostgresStore:
         scopes = tuple(dict.fromkeys(scopes))
         if not scopes:
             return {}
-        async with self.pool.acquire() as connection:
+        async with self.acquire("load_product_states") as connection:
             rows = await connection.fetch(
                 """
                 SELECT *
@@ -474,7 +505,7 @@ class PostgresStore:
                 })
         for row in delivery_rows:
             row["prelease"] = False
-        async with self.pool.acquire() as connection:
+        async with self.acquire("commit_stock_decisions") as connection:
             async with connection.transaction():
                 if lease_credential_key is not None or lease_owner is not None:
                     if not lease_credential_key or not lease_owner:
@@ -786,7 +817,7 @@ class PostgresStore:
         """
         state = _jsonable(state_record)
         targets = tuple(targets)
-        async with self.pool.acquire() as connection:
+        async with self.acquire("commit_stock_decision") as connection:
             async with connection.transaction():
                 if lease_credential_key is not None or lease_owner is not None:
                     if not lease_credential_key or not lease_owner:
@@ -983,7 +1014,7 @@ class PostgresStore:
     ):
         job_id = uuid4()
         expires_at = utc_now() + timedelta(seconds=float(ttl_seconds))
-        async with self.pool.acquire() as connection:
+        async with self.acquire("enqueue_verification") as connection:
             row = await connection.fetchrow(
                 """
                 INSERT INTO stock_verification_jobs (
@@ -1043,7 +1074,7 @@ class PostgresStore:
                 separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
-        async with self.pool.acquire() as connection:
+        async with self.acquire("enqueue_system_alert") as connection:
             async with connection.transaction():
                 await connection.execute(
                     """
@@ -1103,7 +1134,7 @@ class PostgresStore:
         limit=1,
         lease_seconds=30.0,
     ):
-        async with self.pool.acquire() as connection:
+        async with self.acquire("claim_verification_jobs") as connection:
             rows = await connection.fetch(
                 """
                 WITH due AS (
@@ -1167,7 +1198,7 @@ class PostgresStore:
         the newer owner's job state.
         """
         status = "complete" if success else ("pending" if retryable else "failed")
-        async with self.pool.acquire() as connection:
+        async with self.acquire("finish_verification") as connection:
             result = await connection.execute(
                 """
                 UPDATE stock_verification_jobs
@@ -1206,7 +1237,7 @@ class PostgresStore:
                 preferred.append(UUID(str(value)))
             except (TypeError, ValueError, AttributeError):
                 continue
-        async with self.pool.acquire() as connection:
+        async with self.acquire("claim_deliveries") as connection:
             async with connection.transaction():
                 rows = await connection.fetch(
                     """
@@ -1773,11 +1804,12 @@ class PostgresStore:
         )
 
 
-async def connect_and_migrate(dsn=None, pool_max_size=40):
+async def connect_and_migrate(dsn=None, pool_max_size=40, metrics=None):
     store = await PostgresStore.connect(
         dsn=dsn,
         min_size=1,
         max_size=max(2, int(pool_max_size)),
+        metrics=metrics,
     )
     try:
         await store.migrate()

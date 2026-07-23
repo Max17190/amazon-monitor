@@ -20,6 +20,14 @@ def _labels(labels: Mapping[str, str] | None = None) -> tuple[tuple[str, str], .
     return tuple(sorted((str(key), str(value)) for key, value in (labels or {}).items()))
 
 
+def percentile(values, percentile_value):
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return None
+    index = round((float(percentile_value) / 100.0) * (len(ordered) - 1))
+    return ordered[max(0, min(len(ordered) - 1, index))]
+
+
 class HealthStatus(str, Enum):
     READY = "ready"
     NOT_READY = "not_ready"
@@ -61,6 +69,48 @@ class DeliveryMetrics:
 
     def counter(self, name: str, labels: Mapping[str, str] | None = None) -> int:
         return self.counters[(name, _labels(labels))]
+
+    def performance_snapshot(self) -> dict[str, object]:
+        """Return a JSON-safe, internally consistent rolling metric snapshot."""
+        with self._lock:
+            counters = [
+                {
+                    "name": name,
+                    "labels": dict(labels),
+                    "value": value,
+                }
+                for (name, labels), value in sorted(self.counters.items())
+            ]
+            gauges = [
+                {
+                    "name": name,
+                    "labels": dict(labels),
+                    "value": value,
+                }
+                for (name, labels), value in sorted(self.gauges.items())
+            ]
+            histograms = []
+            for (name, labels), samples in sorted(self.histograms.items()):
+                values = tuple(samples)
+                if not values:
+                    continue
+                histograms.append(
+                    {
+                        "name": name,
+                        "labels": dict(labels),
+                        "count": len(values),
+                        "p50": percentile(values, 50),
+                        "p95": percentile(values, 95),
+                        "p99": percentile(values, 99),
+                        "max": max(values),
+                        "sum": sum(values),
+                    }
+                )
+        return {
+            "counters": counters,
+            "gauges": gauges,
+            "histograms": histograms,
+        }
 
 
 @dataclass

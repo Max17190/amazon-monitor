@@ -56,7 +56,7 @@ from durable_store import (
     VerificationWrite,
     connect_and_migrate,
 )
-from observability import DeliveryHealth, DeliveryMetrics, HealthStatus
+from observability import DeliveryHealth, DeliveryMetrics, HealthStatus, percentile
 from stock_state import (
     DecisionKind,
     EvidenceSource,
@@ -76,6 +76,7 @@ DEFAULT_LEASE_RENEW_SECONDS = 10.0
 # window so the durable job can still be claimed when its slot arrives.
 DEFAULT_VERIFICATION_TTL_SECONDS = 90.0
 DEFAULT_METRICS_PORT = 9090
+DEFAULT_PERFORMANCE_LOG_INTERVAL_SECONDS = 300.0
 
 
 class CredentialLeaseLost(RuntimeError):
@@ -130,6 +131,15 @@ def _parse_bool(value, default=False):
     if value is None:
         return bool(default)
     return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _operations_port(env=None):
+    env = os.environ if env is None else env
+    return int(
+        env.get("PORT")
+        or env.get("METRICS_PORT")
+        or DEFAULT_METRICS_PORT
+    )
 
 
 def validate_durable_configuration(config, env=None):
@@ -524,6 +534,10 @@ class OperationsServer:
             label_text = self._format_labels(labels)
             lines.append(f"{name}_count{label_text} {len(values)}")
             lines.append(f"{name}_sum{label_text} {sum(values)}")
+            lines.append(f"{name}_p50{label_text} {percentile(values, 50)}")
+            lines.append(f"{name}_p95{label_text} {percentile(values, 95)}")
+            lines.append(f"{name}_p99{label_text} {percentile(values, 99)}")
+            lines.append(f"{name}_max{label_text} {max(values)}")
         return "\n".join(lines) + "\n"
 
     @staticmethod
@@ -1262,12 +1276,23 @@ async def _poll_credential(
     confirmation_throttle = ConfirmationThrottle(
         os.getenv("FAST_ALERT_CONFIRM_EVERY_POLLS", "12")
     )
+    borrow_confirmation_slot = _parse_bool(
+        os.getenv("TVSS_CONFIRMATION_SLOT_BORROWING"),
+        default=False,
+    )
     while not stop_event.is_set() and runtime_status.leader_owned:
         try:
             with trace_span(coordinator.tracer, "tvss.batch_poll"):
                 batch = await client.batch_products(session, asins)
             request_timing = getattr(batch, "timing", None)
             if request_timing is not None:
+                metrics.increment(
+                    "tvss_request_total",
+                    labels={
+                        "request_class": "poll",
+                        "outcome": "success",
+                    },
+                )
                 metrics.observe(
                     "tvss_request_duration_seconds",
                     max(0.0, request_timing.request_wall_ms / 1000.0),
@@ -1331,6 +1356,13 @@ async def _poll_credential(
                 "TVSS credential lease was fenced during poll work"
             )
         except TVSSRateLimitError as exc:
+            metrics.increment(
+                "tvss_request_total",
+                labels={
+                    "request_class": "poll",
+                    "outcome": "rate_limited",
+                },
+            )
             if calibration_store is not None:
                 await calibration_store.invalidate_credential(
                     client.credential_key, client.marketplace_id
@@ -1415,7 +1447,51 @@ async def _poll_credential(
         job = jobs[0]
         try:
             confirmation_started = time.monotonic()
-            product = await client.product(session, job["asin"])
+            created_at = job.get("created_at")
+            if isinstance(created_at, datetime):
+                metrics.observe(
+                    "tvss_batch_to_confirmation_start_seconds",
+                    max(0.0, (_utc_now() - created_at).total_seconds()),
+                    labels={
+                        "slot_policy": (
+                            "borrow" if borrow_confirmation_slot else "scheduled"
+                        )
+                    },
+                )
+            product = await client.product(
+                session,
+                job["asin"],
+                borrow_confirmation_slot=borrow_confirmation_slot,
+            )
+            confirmation_timing = client.last_request_timing
+            if confirmation_timing is not None:
+                metrics.increment(
+                    "tvss_request_total",
+                    labels={
+                        "request_class": "confirm",
+                        "outcome": "success",
+                    },
+                )
+                metrics.observe(
+                    "tvss_request_duration_seconds",
+                    max(
+                        0.0,
+                        confirmation_timing.request_wall_ms / 1000.0,
+                    ),
+                    labels={"request_class": "confirm"},
+                )
+                metrics.observe(
+                    "tvss_request_cadence_wait_seconds",
+                    max(
+                        0.0,
+                        confirmation_timing.cadence_wait_ms / 1000.0,
+                    ),
+                    labels={"request_class": "confirm"},
+                )
+                if confirmation_timing.confirmation_slot_borrowed:
+                    metrics.increment(
+                        "tvss_confirmation_slot_borrowed_total"
+                    )
             evidence = _full_evidence(
                 coordinator,
                 product,
@@ -1431,7 +1507,6 @@ async def _poll_credential(
             await store.finish_verification(
                 job["job_id"], worker_id, success=True
             )
-            created_at = job.get("created_at")
             if isinstance(created_at, datetime):
                 metrics.observe(
                     "stock_confirmation_latency_seconds",
@@ -1448,6 +1523,13 @@ async def _poll_credential(
                 "TVSS credential lease was fenced during confirmation work"
             )
         except TVSSRateLimitError:
+            metrics.increment(
+                "tvss_request_total",
+                labels={
+                    "request_class": "confirm",
+                    "outcome": "rate_limited",
+                },
+            )
             if calibration_store is not None:
                 await calibration_store.invalidate_credential(
                     client.credential_key, client.marketplace_id
@@ -1655,6 +1737,56 @@ async def _maintenance_loop(store, metrics, stop_event):
             pass
 
 
+def _performance_window(metrics):
+    return {
+        "stage": "performance_window",
+        "experiment_id": str(
+            os.getenv("PERFORMANCE_EXPERIMENT_ID", "production")
+        ).strip(),
+        "variant": str(
+            os.getenv("PERFORMANCE_VARIANT", "control")
+        ).strip(),
+        "project_id": str(os.getenv("RAILWAY_PROJECT_ID", "")).strip(),
+        "service_id": str(os.getenv("RAILWAY_SERVICE_ID", "")).strip(),
+        "deployment_id": str(
+            os.getenv("RAILWAY_DEPLOYMENT_ID", "")
+        ).strip(),
+        "region": str(
+            os.getenv("RAILWAY_REPLICA_REGION", "local")
+        ).strip(),
+        "metrics": metrics.performance_snapshot(),
+    }
+
+
+async def _performance_log_loop(metrics, stop_event):
+    interval = float(
+        os.getenv(
+            "PERFORMANCE_LOG_INTERVAL_SECONDS",
+            str(DEFAULT_PERFORMANCE_LOG_INTERVAL_SECONDS),
+        )
+    )
+    if interval <= 0:
+        return
+    while not stop_event.is_set():
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            logging.info(
+                "performance_window %s",
+                json.dumps(
+                    _performance_window(metrics),
+                    separators=(",", ":"),
+                ),
+            )
+    logging.info(
+        "performance_window %s",
+        json.dumps(
+            _performance_window(metrics),
+            separators=(",", ":"),
+        ),
+    )
+
+
 async def _outbox_notification_listener(
     store,
     wakeup,
@@ -1782,8 +1914,12 @@ async def _connection_warmer(session, targets, metrics, stop_event):
 
 async def run_durable_monitor(config, webhook_targets):
     monitor_id = validate_durable_configuration(config)
+    metrics = DeliveryMetrics()
+    database_pool_size = int(os.getenv("DATABASE_POOL_SIZE", "40"))
+    metrics.set_gauge("database_pool_max_size", database_pool_size)
     store = await connect_and_migrate(
-        pool_max_size=int(os.getenv("DATABASE_POOL_SIZE", "40"))
+        pool_max_size=database_pool_size,
+        metrics=metrics,
     )
     client = None
     operations = None
@@ -1863,7 +1999,6 @@ async def run_durable_monitor(config, webhook_targets):
         asin_groups, asin_targets = _build_group_maps(
             config, webhook_targets
         )
-        metrics = DeliveryMetrics()
         metrics.set_gauge(
             "tvss_effective_calibrated_interval_seconds", standby_interval
         )
@@ -1979,7 +2114,7 @@ async def run_durable_monitor(config, webhook_targets):
                 metrics,
                 delivery_health,
                 runtime_status,
-                int(os.getenv("METRICS_PORT", str(DEFAULT_METRICS_PORT))),
+                _operations_port(),
             )
             await operations.start()
             worker_task = asyncio.create_task(
@@ -2021,6 +2156,10 @@ async def run_durable_monitor(config, webhook_targets):
                 ),
                 name="alert-connection-warmer",
             )
+            performance_task = asyncio.create_task(
+                _performance_log_loop(metrics, stop_event),
+                name="performance-log-loop",
+            )
             await stop_event.wait()
             runtime_status.stopping = True
             worker.stop()
@@ -2030,6 +2169,7 @@ async def run_durable_monitor(config, webhook_targets):
                 maintenance_task,
                 notification_task,
                 warmer_task,
+                performance_task,
                 return_exceptions=True,
             )
             for result in results:

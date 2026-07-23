@@ -19,6 +19,7 @@ from durable_runtime import (
     _batch_product_payload,
     _build_group_maps,
     _leader_supervisor,
+    _operations_port,
     _outbox_notification_listener,
     validate_durable_configuration,
 )
@@ -185,6 +186,13 @@ class DurableConfigurationTests(unittest.TestCase):
 
     def test_fast_alert_default_confirmation_ttl_covers_throttled_window(self):
         self.assertGreaterEqual(DEFAULT_VERIFICATION_TTL_SECONDS, 65.0)
+
+    def test_operations_port_uses_railway_assigned_port(self):
+        self.assertEqual(
+            _operations_port({"PORT": "4321", "METRICS_PORT": "9090"}),
+            4321,
+        )
+        self.assertEqual(_operations_port({"METRICS_PORT": "9191"}), 9191)
 
     def test_leader_supervisor_accepts_calibration_authority_arguments(self):
         inspect.signature(_leader_supervisor).bind(
